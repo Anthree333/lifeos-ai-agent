@@ -1,0 +1,33 @@
+# Core
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# Database
+sqlite-utils>=3.0.0
+
+# LLM
+openai>=1.0.0
+httpx>=0.24.0
+
+# MCP
+mcp>=1.0.0
+
+# RAG
+chromadb>=0.4.0
+pypdf>=4.0.0
+
+# Vision / OCR fallback
+pillow>=10.0.0
+pytesseract>=0.3.10
+
+# UI
+streamlit>=1.30.0
+plotly>=5.0.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Utils
+python-dateutil>=2.8.0
+uuid7>=0.1.0

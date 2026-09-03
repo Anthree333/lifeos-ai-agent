@@ -1,0 +1,21 @@
+[server]
+headless = true
+port = 8501
+address = "localhost"
+enableCORS = false
+enableXsrfProtection = true
+enableWebsocketCompression = false
+cookieSecret = "2ddbc75cf50f4104a1ca58b79e1559795daa0a73646460037118439fc96279d3"
+allowedHosts = []
+maxUploadSize = 200
+maxMessageSize = 200
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = false
+toolbarMode = "minimal"
+
+[logger]
+level = "info"

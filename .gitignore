@@ -1,0 +1,20 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 运行产物
+data/*.db
+data/*.db-*
+data/knowledge/
+data/uploads/
+outputs/
+docs/screenshots/
+demo/screenshots/
+
+# IDE
+.idea/
+.vscode/
