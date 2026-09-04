@@ -300,14 +300,43 @@ class InputParser:
 
     @staticmethod
     def _is_explicit_goal_phrase(text: str) -> bool:
-        """判断是否明显在提出目标，而不是陈述已发生的事件。"""
-        if not any(word in text for word in ("我要", "我想", "目标是", "需要")):
-            return False
-        action_words = (
-            "参加", "提交", "准备", "复习", "学习", "完成",
-            "考试", "比赛", "报告", "项目", "作业", "论文", "写",
+        """判断是否明显在提出目标（NEW_GOAL），而非陈述事件或闲聊。
+
+        NEW_GOAL 特征：表达要完成的任务/作品/考试，有隐含或明确的截止日期。
+        NEW_EVENT 特征：已经安排好的日程（看医生/聚会/会议），是具体时间点事件。
+        """
+        # 先排除明显的事件词：已经安排好的日程不是目标
+        event_keywords = (
+            "去看医生", "去医院", "看病", "聚会", "聚餐", "约会",
+            "开会", "会议", "讲座", "上课", "演出", "电影", "演唱会",
         )
-        return any(word in text for word in action_words)
+        if any(kw in text for kw in event_keywords):
+            return False
+
+        # 核心判断：我 + 要/想/需要 + 动作词
+        # 中间可以夹日期（如 "我10月15日要交..."）
+        if re.search(r"我(?:.+?)(?:要|想|需要)", text):
+            action_words = (
+                "参加", "提交", "准备", "复习", "学习", "完成",
+                "考试", "比赛", "报告", "项目", "作业", "论文",
+                "交", "写", "做", "攻克", "拿下", "考研", "保研",
+                "答辩", "面试", "出", "通过",
+            )
+            return any(word in text for word in action_words)
+        return False
+
+    @staticmethod
+    def _is_affirmative_only(text: str) -> bool:
+        """判断是否是纯粹的确认回复（好的/嗯/可以），用于 run() 里优先走确认分支。"""
+        affirmative = {
+            "好", "好的", "好呀", "好啊", "好嘞", "好哒", "好滴",
+            "嗯", "嗯嗯", "行", "行的", "可以", "是的", "是", "对",
+            "对的", "要", "需要", "确认", "安排", "ok", "okay", "yes",
+            "没问题", "当然", "当然可以", "麻烦你了", "帮我安排",
+            "这样安排", "就这么办", "没问题", "开始吧", "开始",
+        }
+        t = text.strip().lower().strip("，。,.！！?？")
+        return len(t) <= 10 and t in affirmative
 
     @staticmethod
     def _clean_goal_title(text: str) -> str:

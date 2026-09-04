@@ -328,42 +328,57 @@ class LifeAgent:
     def run(self, user_message: str, now: Optional[datetime] = None) -> AgentResult:
         """执行一轮 Agent 循环。
 
-        Args:
-            user_message: 用户自然语言输入
-            now: 当前时间（测试用）
-
-        Returns:
-            AgentResult
+        核心流程：
+        1. 若上一轮在等确认（_pending_confirm），且本轮是肯定词 → 用上一条消息正式执行
+        2. 否则正常解析 → NEW_GOAL/NEW_EVENT 先不执行，反问确认 → 设 pending_confirm
+        3. 其他意图直接执行（状态更新 + 规划/回复）
         """
         if now is None:
             now = datetime.now()
 
-        # Step 1: 解析输入
-        # 若上一轮在等用户确认，且本轮是肯定回复，则把上一条消息当作正式输入解析
         parse_context: Dict[str, Any] = {
             "tasks": [{"title": t.title, "id": t.id} for t in self._tasks],
         }
+
+        # ===== 确认分支 =====
         if self._pending_confirm and self._is_affirmative(user_message):
             confirmed_message = self._pending_confirm
             self._pending_confirm = None
             parse_context["confirming"] = True
             user_message = confirmed_message
-        else:
-            self._pending_confirm = None
 
+            parse_result = self.parser.parse(
+                user_message, context=parse_context, now=now
+            )
+            self._apply_parse_result(parse_result, now)
+            need_replan = self._should_replan(parse_result)
+            if need_replan:
+                result = self._do_replan(parse_result, now, user_message)
+            else:
+                result = self._reply_no_change(parse_result, now)
+            self.persist_state()
+            return result
+
+        # ===== 普通输入 =====
+        self._pending_confirm = None
         parse_result = self.parser.parse(
-            user_message,
-            context=parse_context,
-            now=now,
+            user_message, context=parse_context, now=now
         )
 
-        # Step 2: 状态更新
+        # NEW_GOAL / NEW_EVENT 先确认，不立即执行
+        if parse_result.intent in (ParseIntent.NEW_GOAL, ParseIntent.NEW_EVENT):
+            self._pending_confirm = user_message
+            reply = self._build_confirm_reply(parse_result, user_message)
+            return AgentResult(
+                reply=reply,
+                snapshot=self.current_snapshot,
+                changed=False,
+                intent=parse_result.intent,
+            )
+
+        # 其他意图直接执行
         self._apply_parse_result(parse_result, now)
-
-        # Step 3: 判断是否需要重规划
         need_replan = self._should_replan(parse_result)
-
-        # Step 4 & 5: 重规划 + 解释 / 或直接回答
         if need_replan:
             result = self._do_replan(parse_result, now, user_message)
         elif parse_result.intent == ParseIntent.UNKNOWN:
@@ -371,7 +386,6 @@ class LifeAgent:
         else:
             result = self._reply_no_change(parse_result, now)
 
-        # 状态查询不修改任何内容，跳过无意义写库
         if parse_result.intent not in (
             ParseIntent.STATUS_QUERY,
             ParseIntent.UNKNOWN,
@@ -802,6 +816,36 @@ class LifeAgent:
         """判断是否为简短的肯定回复（用于确认上一轮的待确认意图）。"""
         text = message.strip().lower().strip("。，！？!?~～,. .")
         return len(text) <= 10 and text in cls._AFFIRMATIVE_REPLIES
+
+    def _build_confirm_reply(
+        self, parse_result: ParseResult, user_message: str
+    ) -> str:
+        """生成待确认的回复，引导用户说「好的」再执行。"""
+        if parse_result.intent == ParseIntent.NEW_GOAL:
+            title = (
+                (parse_result.goal_data or {}).get("title")
+                or self.parser._clean_goal_title(user_message)
+            )
+            dl = (parse_result.goal_data or {}).get("deadline", "")
+            dl_text = f"（截止 {dl}）" if dl else ""
+            return (
+                f"我理解你的目标是：{title}{dl_text}。"
+                f"要帮你安排到每日计划里吗？回复「好的」就开始。"
+            )
+        if parse_result.intent == ParseIntent.NEW_EVENT:
+            if parse_result.life_events:
+                ev = parse_result.life_events[0]
+                title = getattr(ev, "title", "") or user_message[:30]
+                etime = getattr(ev, "event_time", "")
+                etime_text = f"（{etime}）" if etime else ""
+            else:
+                title = user_message[:30]
+                etime_text = ""
+            return (
+                f"我记下一个事件：{title}{etime_text}。"
+                f"要把它加入日程并重新安排任务吗？回复「好的」就开始。"
+            )
+        return "好的，我记下了。"
 
     def _reply_no_change(self, parse_result: ParseResult, now: datetime) -> AgentResult:
         """不需要重规划时的回复。"""

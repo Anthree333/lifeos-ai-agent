@@ -21,11 +21,19 @@ from lifeops.agent import LifeAgent
 from lifeops.storage.database import get_db
 
 # UI 启动时加载 .env（Streamlit 不会自动读取）
+_env_warnings = []
 try:
     from dotenv import load_dotenv
     env_path = Path(__file__).resolve().parent.parent / ".env"
+    env_example_path = env_path.parent / ".env.example"
     if env_path.exists():
         load_dotenv(env_path, override=False)
+    elif env_example_path.exists():
+        _env_warnings.append(
+            "⚠️ 未找到 `.env` 配置文件，AI 对话功能不可用。"
+            f" 请复制 `.env.example` 为 `.env` 并填入 API 密钥："
+            "运行 `cp .env.example .env`（Windows 用 `copy .env.example .env`）。"
+        )
 except ImportError:
     pass
 
@@ -1213,8 +1221,12 @@ if "agent" not in st.session_state:
     from lifeops.llm import ChatModel
     try:
         llm = ChatModel.from_env()
-    except Exception:
+    except Exception as _e:
         llm = None
+        _msg = str(_e)
+        if _env_warnings:
+            _env_warnings.append("")  # 空行分隔
+        _env_warnings.append(f"⚠️ LLM 初始化失败：{_msg}。请检查 `.env` 中的 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。")
 
     agent = LifeAgent(profile=profile, db=db, llm=llm)
 
@@ -1477,6 +1489,13 @@ if main_view != "home":
 # ==========================================
 # 主内容区 — 头部（默认 LifeOS 界面）
 # ==========================================
+
+# 启动时的环境/配置警告提示
+for _w in _env_warnings:
+    if _w.strip():
+        st.warning(_w, icon="⚠️")
+if _env_warnings:
+    st.info("配置好之后刷新页面即可生效。", icon="💡")
 now_hour = datetime.now().hour
 if now_hour < 6:
     greeting = "夜深了"
