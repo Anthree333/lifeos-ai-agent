@@ -11,7 +11,7 @@ from datetime import datetime
 
 from ..models import (
     StudentProfile, Goal, Task, Commitment,
-    TimeSlot, PlanSnapshot, ChangeLog, SacrificeItem,
+    TimeSlot, PlanSnapshot, ChangeLog, ChangeLogItem, SacrificeItem,
     ExecutionRecord, LifeEvent, RiskReport,
     TaskStatus, DeadlineType, EnergyLevel, CommitmentType,
     EventType, RiskLevel,
@@ -197,6 +197,24 @@ CREATE TABLE IF NOT EXISTS knowledge_documents (
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
+-- 待确认动作（对话状态，进程重启后仍可恢复）
+CREATE TABLE IF NOT EXISTS pending_actions (
+    profile_id TEXT PRIMARY KEY,
+    action_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- 学习笔记
+CREATE TABLE IF NOT EXISTS notes (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_tasks_goal_id ON tasks(goal_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -350,6 +368,23 @@ class Database:
         )
         self.conn.commit()
 
+    def delete_goal(self, goal_id: str) -> None:
+        """删除目标（同时级联删除其下属任务及任务执行记录）。"""
+        # 先找出该目标下所有任务 id
+        rows = self.conn.execute(
+            "SELECT id FROM tasks WHERE goal_id = ?", (goal_id,)
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            # 删除该任务的执行记录（executions.task_id 引用 tasks.id）
+            self.conn.execute(
+                "DELETE FROM executions WHERE task_id = ?", (task_id,)
+            )
+        # 再删 tasks，最后删 goals
+        self.conn.execute("DELETE FROM tasks WHERE goal_id = ?", (goal_id,))
+        self.conn.execute("DELETE FROM goals WHERE id = ?", (goal_id,))
+        self.conn.commit()
+
     def _row_to_goal(self, row: sqlite3.Row) -> Goal:
         return Goal(
             id=row["id"],
@@ -438,6 +473,14 @@ class Database:
         """批量保存任务。"""
         for task in tasks:
             self.save_task(task)
+
+    def delete_task(self, task_id: str) -> bool:
+        """删除单个任务（同时删除其执行记录），返回是否真的删掉了。"""
+        # executions.task_id 引用 tasks.id，先清执行记录
+        self.conn.execute("DELETE FROM executions WHERE task_id = ?", (task_id,))
+        cursor = self.conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     def update_task_progress(self, task_id: str, progress: float,
                              actual_minutes: int = 0) -> None:
@@ -539,12 +582,37 @@ class Database:
 
         change_log_json = "{}"
         if snapshot.change_log:
+            cl = snapshot.change_log
             change_log_json = json.dumps({
-                "trigger_reason": snapshot.change_log.trigger_reason,
-                "summary": snapshot.change_log.summary,
-                "detail": snapshot.change_log.detail,
-                "reason": snapshot.change_log.reason,
-                "affected_tasks": snapshot.change_log.affected_tasks,
+                "trigger_reason": cl.trigger_reason,
+                "summary": cl.summary,
+                "detail": cl.detail,
+                "reason": cl.reason,
+                "affected_tasks": cl.affected_tasks,
+                "items": [
+                    {
+                        "task_id": it.task_id,
+                        "task_title": it.task_title,
+                        "action": it.action.value if hasattr(it.action, "value") else it.action,
+                        "old_time": it.old_time,
+                        "new_time": it.new_time,
+                        "old_duration": it.old_duration,
+                        "new_duration": it.new_duration,
+                        "reason": it.reason,
+                    }
+                    for it in cl.items
+                ] if cl.items else [],
+                "sacrifice_list": [
+                    {
+                        "task_id": s.task_id,
+                        "task_title": s.task_title,
+                        "reason": s.reason,
+                        "priority_before": s.priority_before,
+                        "action": s.action,
+                        "delayed_to": s.delayed_to,
+                    }
+                    for s in cl.sacrifice_list
+                ] if cl.sacrifice_list else [],
             }, ensure_ascii=False)
 
         sacrifice_json = json.dumps([
@@ -621,6 +689,57 @@ class Database:
         ).fetchall()
         return [self._load_snapshot_with_slots(r) for r in rows]
 
+    def clear_all_snapshots(self, profile_id: Optional[str] = None) -> int:
+        """删除所有历史计划快照（及其 time_slots / risk_reports），返回删除条数。
+
+        若指定 profile_id 则只删该用户的；否则删全部。
+        当前正在使用的快照不在快照表中删除后不会影响 agent.current_snapshot（内存对象），
+        下次重排会重建。
+        """
+        if profile_id:
+            ids = [r[0] for r in self.conn.execute(
+                "SELECT id FROM plan_snapshots WHERE profile_id = ?", (profile_id,)
+            )]
+        else:
+            ids = [r[0] for r in self.conn.execute("SELECT id FROM plan_snapshots")]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        # 先删依赖快照的从表，再删主表
+        self.conn.execute(
+            f"DELETE FROM time_slots WHERE snapshot_id IN ({placeholders})", ids
+        )
+        self.conn.execute(
+            f"DELETE FROM risk_reports WHERE snapshot_id IN ({placeholders})", ids
+        )
+        if profile_id:
+            self.conn.execute(
+                "DELETE FROM plan_snapshots WHERE profile_id = ?", (profile_id,)
+            )
+        else:
+            self.conn.execute("DELETE FROM plan_snapshots")
+        self.conn.commit()
+        return len(ids)
+
+    def delete_snapshot(self, snapshot_id: str) -> bool:
+        """删除单条历史快照（含其 time_slots / risk_reports）。"""
+        existed = self.conn.execute(
+            "SELECT 1 FROM plan_snapshots WHERE id = ?", (snapshot_id,)
+        ).fetchone()
+        if not existed:
+            return False
+        self.conn.execute(
+            "DELETE FROM time_slots WHERE snapshot_id = ?", (snapshot_id,)
+        )
+        self.conn.execute(
+            "DELETE FROM risk_reports WHERE snapshot_id = ?", (snapshot_id,)
+        )
+        self.conn.execute(
+            "DELETE FROM plan_snapshots WHERE id = ?", (snapshot_id,)
+        )
+        self.conn.commit()
+        return True
+
     def _load_snapshot_with_slots(self, row: sqlite3.Row) -> PlanSnapshot:
         snapshot = PlanSnapshot(
             id=row["id"],
@@ -654,7 +773,7 @@ class Database:
             for s in sacrifice_data
         ]
 
-        # 加载变更日志
+        # 加载变更日志（兼容旧数据：缺 items / sacrifice_list 字段时留空）
         if row["change_log_json"]:
             cl_data = json.loads(row["change_log_json"])
             snapshot.change_log = ChangeLog(
@@ -663,6 +782,30 @@ class Database:
                 detail=cl_data.get("detail", ""),
                 reason=cl_data.get("reason", ""),
                 affected_tasks=cl_data.get("affected_tasks", []),
+                items=[
+                    ChangeLogItem(
+                        task_id=it.get("task_id", ""),
+                        task_title=it.get("task_title", ""),
+                        action=it.get("action", "kept"),
+                        old_time=it.get("old_time"),
+                        new_time=it.get("new_time"),
+                        old_duration=it.get("old_duration"),
+                        new_duration=it.get("new_duration"),
+                        reason=it.get("reason", ""),
+                    )
+                    for it in cl_data.get("items", [])
+                ],
+                sacrifice_list=[
+                    SacrificeItem(
+                        task_id=s.get("task_id", ""),
+                        task_title=s.get("task_title", ""),
+                        reason=s.get("reason", ""),
+                        priority_before=s.get("priority_before", 0.0),
+                        action=s.get("action", "delayed"),
+                        delayed_to=s.get("delayed_to"),
+                    )
+                    for s in cl_data.get("sacrifice_list", [])
+                ],
             )
 
         return snapshot
@@ -756,6 +899,41 @@ class Database:
         self.conn.commit()
 
     # ==========================================
+    # Pending Action（待确认对话状态）
+    # ==========================================
+
+    def save_pending_action(self, profile_id: str, payload: Dict[str, Any]) -> None:
+        """保存当前待确认动作（每个 profile 仅保留一条，覆盖旧值）。"""
+        now = datetime.now().isoformat()
+        action_json = json.dumps(payload, ensure_ascii=False)
+        self.conn.execute(
+            """INSERT OR REPLACE INTO pending_actions (profile_id, action_json, created_at)
+               VALUES (?, ?, ?)""",
+            (profile_id, action_json, now),
+        )
+        self.conn.commit()
+
+    def load_pending_action(self, profile_id: str) -> Optional[Dict[str, Any]]:
+        """读取最近一条待确认动作，无则返回 None。"""
+        row = self.conn.execute(
+            "SELECT action_json FROM pending_actions WHERE profile_id = ?",
+            (profile_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row["action_json"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def clear_pending_action(self, profile_id: str) -> None:
+        """清除待确认动作。"""
+        self.conn.execute(
+            "DELETE FROM pending_actions WHERE profile_id = ?", (profile_id,)
+        )
+        self.conn.commit()
+
+    # ==========================================
     # Knowledge Documents
     # ==========================================
 
@@ -816,6 +994,85 @@ class Database:
         ]
 
     # ==========================================
+    # Notes（学习笔记）
+    # ==========================================
+
+    def save_note(self, note_id: Optional[str] = None, title: str = "",
+                  content: str = "", tags: Optional[List[str]] = None,
+                  pinned: bool = False) -> str:
+        """新增或整体覆盖一篇笔记，返回笔记 id。"""
+        now = datetime.now().isoformat()
+        nid = note_id or str(uuid.uuid4())
+        tags_json = json.dumps(tags or [], ensure_ascii=False)
+        self.conn.execute(
+            """INSERT INTO notes (id, title, content, tags, pinned, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 title=excluded.title, content=excluded.content,
+                 tags=excluded.tags, pinned=excluded.pinned,
+                 updated_at=excluded.updated_at""",
+            (nid, title, content, tags_json, 1 if pinned else 0, now, now),
+        )
+        self.conn.commit()
+        return nid
+
+    def update_note(self, note_id: str, **fields: Any) -> bool:
+        """局部更新笔记字段（title/content/tags/pinned），自动刷新 updated_at。
+
+        返回是否真的有笔记被更新（笔记不存在时返回 False）。
+        """
+        allowed = {"title", "content", "tags", "pinned"}
+        sets: List[str] = []
+        vals: List[Any] = []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            if key == "tags":
+                value = json.dumps(list(value or []), ensure_ascii=False)
+            elif key == "pinned":
+                value = 1 if value else 0
+            sets.append(f"{key}=?")
+            vals.append(value)
+        if not sets:
+            return False
+        sets.append("updated_at=?")
+        vals.append(datetime.now().isoformat())
+        vals.append(note_id)
+        cur = self.conn.execute(
+            f"UPDATE notes SET {', '.join(sets)} WHERE id=?", vals
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def delete_note(self, note_id: str) -> bool:
+        """删除一篇笔记，返回是否存在并被删除。"""
+        cur = self.conn.execute("DELETE FROM notes WHERE id=?", (note_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def list_notes(self) -> List[dict]:
+        """列出全部笔记：置顶优先、最近更新在前。
+
+        每个 dict 包含：id, title, content, tags(列表), pinned, created_at, updated_at
+        """
+        rows = self.conn.execute(
+            """SELECT id, title, content, tags, pinned, created_at, updated_at
+               FROM notes ORDER BY pinned DESC, updated_at DESC"""
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "content": row["content"],
+                "tags": json.loads(row["tags"] or "[]"),
+                "pinned": bool(row["pinned"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    # ==========================================
     # LLM Cache
     # ==========================================
 
@@ -854,11 +1111,17 @@ _db_instance: Optional[Database] = None
 
 
 def get_db(db_path: Optional[str] = None) -> Database:
-    """获取数据库单例。"""
+    """获取数据库单例（每次调用都会幂等执行建表语句）。
+
+    代码热更新（服务器未重启）或磁盘上为旧库文件时，缓存连接里的 schema
+    可能缺少新表；这里每次调用都重跑 init_schema 自动补齐，避免
+    “no such table”一类的运行时错误。
+    """
     global _db_instance
     if _db_instance is None:
         if db_path is None:
             db_path = os.environ.get("DB_PATH", "./data/lifeos.db")
         _db_instance = Database(db_path)
-        _db_instance.init_schema()
+    # 幂等：全部为 CREATE TABLE/INDEX IF NOT EXISTS，重复执行无副作用、开销极小
+    _db_instance.init_schema()
     return _db_instance

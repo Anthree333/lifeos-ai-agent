@@ -340,6 +340,7 @@ class Scheduler:
             scheduled_hard_tasks=scheduled_hard,
             priority_scores=priority_scores,
             now=now,
+            wake_up_hour=self.profile.wake_up_time.hour,
         )
 
         # ==========================================

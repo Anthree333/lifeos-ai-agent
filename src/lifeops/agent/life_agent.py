@@ -12,13 +12,14 @@
 from __future__ import annotations
 
 import uuid
+import difflib
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional
 
 from ..models import (
     StudentProfile, Goal, Task, Commitment,
-    PlanSnapshot, TimeSlot, ChangeLog, ExecutionRecord, LifeEvent,
+    PlanSnapshot, TimeSlot, ChangeLog, ExecutionRecord, LifeEvent, EventType,
     TaskStatus, DeadlineType,
 )
 from ..scheduler import Scheduler, ScheduleResult
@@ -40,6 +41,46 @@ class AgentResult:
     schedule_result: Optional[ScheduleResult] = None  # 调度结果
     parsed_screenshot: Optional[Any] = None     # 截图解析结果（供用户确认）
     rag_references: List[Any] = field(default_factory=list)  # RAG 引用列表
+
+
+@dataclass
+class PendingAction:
+    """待用户确认的动作。
+
+    - NEW_GOAL / NEW_EVENT：直接保存解析结果，确认时不再二次调用 LLM，避免结果漂移；
+    - 闲聊反问（intent 为空）：只存原始消息，确认时再重新解析。
+    """
+
+    message: str
+    intent: Optional[str] = None                        # ParseIntent.value
+    goal_data: Optional[Dict[str, Any]] = None
+    life_events: Optional[List[Dict[str, Any]]] = None  # LifeEvent 的 dict 表示
+    cancel_data: Optional[Dict[str, Any]] = None        # 取消计划的请求
+    created_at: str = field(
+        default_factory=lambda: datetime.now().isoformat()
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "message": self.message,
+            "intent": self.intent,
+            "goal_data": self.goal_data,
+            "life_events": self.life_events,
+            "cancel_data": self.cancel_data,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PendingAction":
+        return cls(
+            message=data.get("message", ""),
+            intent=data.get("intent"),
+            goal_data=data.get("goal_data"),
+            life_events=data.get("life_events"),
+            cancel_data=data.get("cancel_data"),
+            created_at=data.get("created_at")
+            or datetime.now().isoformat(),
+        )
 
 
 class LifeAgent:
@@ -69,8 +110,13 @@ class LifeAgent:
         self.knowledge_base = knowledge_base
         self.retriever = retriever
 
-        # 待确认的消息：闲聊反问"需要我帮你排计划吗"后，等待用户肯定回复
-        self._pending_confirm: Optional[str] = None
+        # 待确认的动作：NEW_GOAL/NEW_EVENT/CANCEL_PLAN 或闲聊反问后等待用户确认
+        # 会持久化到数据库，进程重启后仍可恢复（不依赖单条内存消息）
+        self._pending_action: Optional[PendingAction] = None
+
+        # 最近一次取消操作的摘要与被移除条目数量（用于回复与是否重规划）
+        self._cancel_summary: str = ""
+        self._cancel_removed_count: int = 0
 
         # 内存状态（如果没有数据库，则纯内存运行）
         self._goals: List[Goal] = []
@@ -91,6 +137,53 @@ class LifeAgent:
         """当前最新快照。"""
         return self._snapshots[-1] if self._snapshots else None
 
+    def plan_is_consistent(self) -> bool:
+        """当前最新快照是否与现有任务/承诺一致。
+
+        若最新快照仍引用已被删除的任务或承诺（例如某删除操作未及时触发
+        重排、或历史遗留数据），则返回 False。
+
+        若没有任何快照但存在未完成任务（待开始/进行中），也视为不一致，
+        以便触发重排生成计划（清空历史快照后有任务却无计划的场景）。
+        """
+        snap = self.current_snapshot
+        if snap is None:
+            # 无快照时：若存在未完成任务则需要重排生成计划
+            has_active_tasks = any(
+                t.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)
+                for t in self._tasks
+            )
+            return not has_active_tasks
+        task_ids = {t.id for t in self._tasks}
+        commitment_ids = {c.id for c in self._commitments}
+        for ts in snap.time_slots or []:
+            src = ts.source.value if hasattr(ts.source, "value") else ts.source
+            if src == "task" and ts.task_id and ts.task_id not in task_ids:
+                return False
+            if src == "commitment" and ts.commitment_id and ts.commitment_id not in commitment_ids:
+                return False
+        for s in snap.sacrifice_list or []:
+            if s.task_id and s.task_id not in task_ids:
+                return False
+        return True
+
+    def ensure_plan_consistent(self, now: Optional[datetime] = None) -> bool:
+        """数据自愈：若最新快照引用了已删除的任务/承诺，按当前数据重排一次。
+
+        Returns:
+            True 表示执行了一次校正性重排并生成了新快照；正常时返回 False。
+        """
+        try:
+            if self.plan_is_consistent():
+                return False
+            self.force_replan(
+                reason="计划校正：清理已删除的任务/承诺安排",
+                now=now,
+            )
+            return True
+        except Exception:
+            return False
+
     def load_state(self, profile_id: Optional[str] = None) -> None:
         """从 SQLite 加载目标、任务、承诺和快照历史。"""
         if self.db is None:
@@ -103,6 +196,12 @@ class LifeAgent:
         self._snapshots = self.db.list_snapshots(pid, limit=500)
         # list_snapshots 按时间倒序返回，内存中保持正序快照链
         self._snapshots.sort(key=lambda s: s.created_at)
+
+        # 恢复上次未确认的动作（跨进程/刷新保留对话状态）
+        pending_data = self.db.load_pending_action(pid)
+        self._pending_action = (
+            PendingAction.from_dict(pending_data) if pending_data else None
+        )
 
     def persist_state(self) -> None:
         """将当前内存状态写回 SQLite。"""
@@ -175,11 +274,233 @@ class LifeAgent:
             self.db.delete_commitment(commitment_id)
         return removed
 
+    def remove_task(self, task_id: str) -> bool:
+        """删除单个任务（同时从 SQLite 移除）。"""
+        before = len(self._tasks)
+        self._tasks = [t for t in self._tasks if t.id != task_id]
+        removed = len(self._tasks) < before
+        if removed and self.db is not None:
+            self.db.delete_task(task_id)
+        return removed
+
     def get_goal(self, goal_id: str) -> Optional[Goal]:
         for g in self._goals:
             if g.id == goal_id:
                 return g
         return None
+
+    # ==========================================
+    # 取消计划：按对话意图删除目标/任务/固定安排
+    # ==========================================
+
+    @staticmethod
+    def _title_matches(title: str, keyword: str) -> bool:
+        """标题是否命中关键词：只要有一方包含另一方即算命中。
+
+        用户常把任务全名说出来（"删除整理知识点任务"），提取出的关键词
+        可能与标题互有出入，因此做双向包含匹配。
+        """
+        kw = (keyword or "").strip().lower()
+        name = (title or "").strip().lower()
+        if not kw or not name:
+            return False
+        if kw in name or name in kw:
+            return True
+        # 用户原话提取出的关键词可能与标题互有出入（口语停用词被剥离），
+        # 用相似度兜底，避免"说了全名却匹配不上"
+        return difflib.SequenceMatcher(None, kw, name).ratio() >= 0.6
+
+    @classmethod
+    def _select_by_keyword(cls, items: List[Any], keyword: str) -> List[Any]:
+        """按关键词筛选；没有关键词时，只在候选唯一的情况下才选中（避免误删）。"""
+        if keyword:
+            return [i for i in items if cls._title_matches(getattr(i, "title", ""), keyword)]
+        return list(items) if len(items) == 1 else []
+
+    def _collect_cancel_targets(
+        self, cancel_data: Dict[str, Any]
+    ) -> tuple:
+        """找出本次取消会涉及的目标 / 任务 / 固定安排（不修改状态）。"""
+        target_type = (cancel_data or {}).get("target_type") or "goal"
+        keyword = ((cancel_data or {}).get("keyword") or "").strip()
+        date_str = (cancel_data or {}).get("date")
+
+        goals: List[Goal] = []
+        tasks: List[Task] = []
+        commitments: List[Commitment] = []
+
+        if target_type == "all":
+            goals = list(self._goals)
+            tasks = list(self._tasks)
+        elif target_type == "date":
+            if date_str:
+                tasks = [
+                    t for t in self._tasks
+                    if (t.deadline or "").startswith(str(date_str))
+                    and t.status != TaskStatus.COMPLETED
+                ]
+        elif target_type == "commitment":
+            commitments = self._select_by_keyword(self._commitments, keyword)
+        elif target_type == "task":
+            tasks = self._select_by_keyword(self._tasks, keyword)
+        else:
+            goals = self._select_by_keyword(self._goals, keyword)
+            if not goals and keyword:
+                # 目标没匹配上，但任务匹配上了 → 退一步只删这些任务
+                tasks = [
+                    t for t in self._tasks
+                    if self._title_matches(t.title, keyword)
+                ]
+
+        return goals, tasks, commitments
+
+    def _has_cancel_targets(self, cancel_data: Dict[str, Any]) -> bool:
+        """当前计划里是否存在该取消请求能匹配到的内容。"""
+        goals, tasks, commitments = self._collect_cancel_targets(cancel_data)
+        return bool(goals or tasks or commitments)
+
+    def _preview_cancel(self, cancel_data: Dict[str, Any]) -> str:
+        """生成"将要取消什么"的描述（供确认文案使用，不修改状态）。"""
+        goals, tasks, commitments = self._collect_cancel_targets(cancel_data)
+        if not (goals or tasks or commitments):
+            return self._cancel_not_found_hint(cancel_data)
+
+        parts = []
+        if goals:
+            for goal in goals:
+                count = sum(
+                    1 for t in self._tasks if getattr(t, "goal_id", None) == goal.id
+                )
+                suffix = f"（含 {count} 个任务）" if count else ""
+                parts.append(f"取消目标「{goal.title}」{suffix}")
+        if tasks:
+            preview = "、".join(t.title for t in tasks[:3])
+            more = f" 等 {len(tasks)} 个" if len(tasks) > 3 else f" 共 {len(tasks)} 个"
+            parts.append(f"删除任务：{preview}{more}")
+        if commitments:
+            parts.append(
+                "删除固定安排：" + "、".join(c.title for c in commitments)
+            )
+        return "，".join(parts)
+
+    def _cancel_not_found_hint(self, cancel_data: Dict[str, Any]) -> str:
+        """没匹配到可取消内容时的提示（列出当前计划供用户选择）。"""
+        keyword = ((cancel_data or {}).get("keyword") or "").strip()
+        target_type = (cancel_data or {}).get("target_type") or "goal"
+        label = {
+            "task": "任务", "commitment": "固定安排", "date": "安排", "all": "计划",
+        }.get(target_type, "目标/计划")
+
+        if keyword:
+            hint = f"没找到名称包含「{keyword}」的{label}。"
+        else:
+            hint = f"你还没说清要取消哪个{label}。"
+
+        candidates = [g.title for g in self._goals] or [
+            t.title for t in self._tasks
+        ]
+        if candidates:
+            hint += "当前计划有：" + "、".join(candidates[:5]) + "。"
+        else:
+            hint += "当前还没有任何计划。"
+        return hint
+
+    def _apply_cancel(self, cancel_data: Dict[str, Any]) -> None:
+        """执行取消：删除匹配到的目标 / 任务 / 固定安排，并记录摘要。"""
+        goals, tasks, commitments = self._collect_cancel_targets(cancel_data)
+        self._cancel_removed_count = 0
+        parts = []
+
+        for goal in goals:
+            if self.remove_goal(goal.id):
+                self._cancel_removed_count += 1
+        if goals:
+            parts.append("目标：" + "、".join(g.title for g in goals))
+
+        # 目标被删除后，其任务已从列表移除，只删仍然存在的任务
+        tasks = [t for t in tasks if any(x.id == t.id for x in self._tasks)]
+        for task in tasks:
+            if self.remove_task(task.id):
+                self._cancel_removed_count += 1
+        if tasks:
+            parts.append(f"任务 {len(tasks)} 个：" + "、".join(t.title for t in tasks[:3]))
+
+        for commitment in commitments:
+            if self.remove_commitment(commitment.id):
+                self._cancel_removed_count += 1
+        if commitments:
+            parts.append("固定安排：" + "、".join(c.title for c in commitments))
+
+        if parts:
+            self._cancel_summary = "已取消：" + "；".join(parts)
+        else:
+            self._cancel_summary = self._cancel_not_found_hint(cancel_data)
+
+    def remove_goal(self, goal_id: str) -> bool:
+        """删除目标（连同其下属任务一并移除）。"""
+        before = len(self._goals)
+        # 移除内存中的目标
+        self._goals = [g for g in self._goals if g.id != goal_id]
+        # 移除归属于该目标的任务
+        self._tasks = [t for t in self._tasks if getattr(t, "goal_id", None) != goal_id]
+        removed = len(self._goals) < before
+        if removed and self.db is not None:
+            self.db.delete_goal(goal_id)
+        return removed
+
+    def complete_task(self, task_id: str) -> bool:
+        """将任务标记为已完成（status=completed, progress=1.0）。"""
+        from ..models.goal import TaskStatus
+        task = self.get_task(task_id)
+        if task is None:
+            return False
+        task.status = TaskStatus.COMPLETED
+        task.progress = 1.0
+        if self.db is not None:
+            self.db.save_task(task)
+        return True
+
+    def uncomplete_task(self, task_id: str) -> bool:
+        """取消完成状态（回退为 in_progress, progress=0.5）。"""
+        from ..models.goal import TaskStatus
+        task = self.get_task(task_id)
+        if task is None:
+            return False
+        task.status = TaskStatus.IN_PROGRESS
+        task.progress = 0.5
+        if self.db is not None:
+            self.db.save_task(task)
+        return True
+
+    def start_task(self, task_id: str) -> bool:
+        """把任务标记为「已开始」：仅切换状态为 in_progress。
+
+        与 report_absolute_progress 的区别：那个必须给出具体百分比并会写
+        执行记录；这里只表示“开始动手了”，进度保持 0，等用户真正汇报
+        进度时再由对话/接口更新，避免凭空捏造一个假的百分比。
+        """
+        from ..models.goal import TaskStatus
+        task = self.get_task(task_id)
+        if task is None:
+            return False
+        if task.status == TaskStatus.COMPLETED:
+            return False
+        task.status = TaskStatus.IN_PROGRESS
+        if self.db is not None:
+            self.db.save_task(task)
+        return True
+
+    def reset_task_to_pending(self, task_id: str) -> bool:
+        """把进行中的任务退回待开始（status=pending, progress=0）。"""
+        from ..models.goal import TaskStatus
+        task = self.get_task(task_id)
+        if task is None:
+            return False
+        task.status = TaskStatus.PENDING
+        task.progress = 0.0
+        if self.db is not None:
+            self.db.save_task(task)
+        return True
 
     def get_task(self, task_id: str) -> Task | None:
         for t in self._tasks:
@@ -325,49 +646,62 @@ class LifeAgent:
     # 主入口：五步执行法
     # ==========================================
 
-    def run(self, user_message: str, now: Optional[datetime] = None) -> AgentResult:
+    def run(
+        self,
+        user_message: str,
+        now: Optional[datetime] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
+    ) -> AgentResult:
         """执行一轮 Agent 循环。
 
         核心流程：
-        1. 若上一轮在等确认（_pending_confirm），且本轮是肯定词 → 用上一条消息正式执行
-        2. 否则正常解析 → NEW_GOAL/NEW_EVENT 先不执行，反问确认 → 设 pending_confirm
+        1. 若存在待确认动作（_pending_action），肯定词 → 执行，否定词 → 取消，其他 → 作为新输入
+        2. 正常解析 → 需要确认的 NEW_GOAL/NEW_EVENT 先反问确认并持久化（不重复解析）
         3. 其他意图直接执行（状态更新 + 规划/回复）
+
+        history: 最近对话（[{role, content}]），注入解析与闲聊上下文，形成"记忆"。
         """
         if now is None:
             now = datetime.now()
 
         parse_context: Dict[str, Any] = {
             "tasks": [{"title": t.title, "id": t.id} for t in self._tasks],
+            "history": [dict(h) for h in (history or [])][-8:],
+            "profile_name": self.profile.name,
         }
 
-        # ===== 确认分支 =====
-        if self._pending_confirm and self._is_affirmative(user_message):
-            confirmed_message = self._pending_confirm
-            self._pending_confirm = None
-            parse_context["confirming"] = True
-            user_message = confirmed_message
-
-            parse_result = self.parser.parse(
-                user_message, context=parse_context, now=now
-            )
-            self._apply_parse_result(parse_result, now)
-            need_replan = self._should_replan(parse_result)
-            if need_replan:
-                result = self._do_replan(parse_result, now, user_message)
-            else:
-                result = self._reply_no_change(parse_result, now)
-            self.persist_state()
-            return result
+        # ===== 待确认分支：肯定执行 / 否定取消 / 其他则覆盖 =====
+        if self._pending_action is not None:
+            if self._is_negative(user_message):
+                return self._resolve_pending(confirmed=False, now=now)
+            if self._is_affirmative(user_message):
+                return self._resolve_pending(confirmed=True, now=now)
+            # 非确认/取消内容 → 丢弃旧待确认，当作新输入处理
+            self._set_pending(None)
 
         # ===== 普通输入 =====
-        self._pending_confirm = None
         parse_result = self.parser.parse(
             user_message, context=parse_context, now=now
         )
 
-        # NEW_GOAL / NEW_EVENT 先确认，不立即执行
-        if parse_result.intent in (ParseIntent.NEW_GOAL, ParseIntent.NEW_EVENT):
-            self._pending_confirm = user_message
+        # 需要用户确认的意图（NEW_GOAL / NEW_EVENT / CANCEL_PLAN）：先反问确认，并保存解析结果
+        # 取消属于破坏性操作，无论是否接入 LLM 都必须先确认；
+        # 但没匹配到任何可取消内容时直接给提示，不进确认
+        needs_confirm = self._needs_confirmation(parse_result)
+        if (
+            needs_confirm
+            and parse_result.intent == ParseIntent.CANCEL_PLAN
+            and not self._has_cancel_targets(parse_result.cancel_data or {})
+        ):
+            needs_confirm = False
+        if needs_confirm and (
+            self._confirm_enabled()
+            or parse_result.intent == ParseIntent.CANCEL_PLAN
+        ):
+            action = self._pending_action_from_parse(
+                parse_result, user_message, now
+            )
+            self._set_pending(action)
             reply = self._build_confirm_reply(parse_result, user_message)
             return AgentResult(
                 reply=reply,
@@ -377,12 +711,13 @@ class LifeAgent:
             )
 
         # 其他意图直接执行
+        self._set_pending(None)
         self._apply_parse_result(parse_result, now)
         need_replan = self._should_replan(parse_result)
         if need_replan:
             result = self._do_replan(parse_result, now, user_message)
         elif parse_result.intent == ParseIntent.UNKNOWN:
-            result = self._reply_general(user_message, now)
+            result = self._reply_general(user_message, now, history=history)
         else:
             result = self._reply_no_change(parse_result, now)
 
@@ -391,6 +726,209 @@ class LifeAgent:
             ParseIntent.UNKNOWN,
         ):
             self.persist_state()
+        return result
+
+    # ==========================================
+    # 待确认动作管理（持久化 + 确认/取消）
+    # ==========================================
+
+    @property
+    def pending_action(self) -> Optional[PendingAction]:
+        """当前待用户确认的动作（无则为 None）。"""
+        return self._pending_action
+
+    def _confirm_enabled(self) -> bool:
+        """是否启用"先确认再执行"：有 LLM（真实对话场景）时启用，
+        无 LLM 的确定性/演示模式直接执行，保持向后兼容。"""
+        return self.llm is not None or self.parser.llm is not None
+
+    def _needs_confirmation(self, parse_result: ParseResult) -> bool:
+        """该解析结果是否需要先经过用户确认。"""
+        # 取消计划：一律先确认，避免误删
+        if parse_result.intent == ParseIntent.CANCEL_PLAN:
+            return True
+        if parse_result.intent == ParseIntent.NEW_GOAL and parse_result.goal_data:
+            return True
+        if parse_result.intent == ParseIntent.NEW_EVENT and parse_result.life_events:
+            # 纯生病事件直接执行（生病通常无需二次确认）
+            if all(
+                e.event_type == EventType.ILLNESS
+                for e in parse_result.life_events
+            ):
+                return False
+            return True
+        return False
+
+    @staticmethod
+    def _life_event_to_dict(event: LifeEvent) -> Dict[str, Any]:
+        """把 LifeEvent 转成可 JSON 序列化的 dict。"""
+        return {
+            "title": event.title,
+            "event_type": (
+                event.event_type.value
+                if hasattr(event.event_type, "value")
+                else event.event_type
+            ),
+            "event_time": event.event_time,
+            "end_time": event.end_time,
+            "change_content": event.change_content,
+            "confidence": event.confidence,
+        }
+
+    def _pending_action_from_parse(
+        self,
+        parse_result: ParseResult,
+        user_message: str,
+        now: datetime,
+    ) -> PendingAction:
+        """把刚解析出的意图保存为待确认动作（含结构化结果，确认时不再调 LLM）。"""
+        life_events = None
+        if parse_result.life_events:
+            life_events = [
+                self._life_event_to_dict(e) for e in parse_result.life_events
+            ]
+        return PendingAction(
+            message=user_message,
+            intent=(
+                parse_result.intent.value
+                if parse_result.intent
+                else None
+            ),
+            goal_data=(
+                dict(parse_result.goal_data)
+                if parse_result.goal_data
+                else None
+            ),
+            life_events=life_events,
+            cancel_data=(
+                dict(parse_result.cancel_data)
+                if parse_result.cancel_data
+                else None
+            ),
+            created_at=now.isoformat(),
+        )
+
+    def _set_pending(self, action: Optional[PendingAction]) -> None:
+        """设置/清除待确认动作，并同步持久化。"""
+        self._pending_action = action
+        if self.db is None:
+            return
+        pid = self.profile.id or "default"
+        if action is None:
+            self.db.clear_pending_action(pid)
+        else:
+            self.db.save_pending_action(pid, action.to_dict())
+
+    def _parse_result_from_action(
+        self, action: PendingAction
+    ) -> Optional[ParseResult]:
+        """把待确认动作中的结构化结果还原为 ParseResult（不重新调用 LLM）。"""
+        try:
+            intent = ParseIntent(action.intent) if action.intent else None
+        except ValueError:
+            intent = None
+
+        if intent == ParseIntent.NEW_GOAL and action.goal_data:
+            return ParseResult(
+                intent=intent,
+                confidence=0.9,
+                goal_data=dict(action.goal_data),
+            )
+
+        if intent == ParseIntent.CANCEL_PLAN and action.cancel_data:
+            return ParseResult(
+                intent=intent,
+                confidence=0.9,
+                cancel_data=dict(action.cancel_data),
+            )
+
+        if intent == ParseIntent.NEW_EVENT and action.life_events:
+            events = []
+            for raw in action.life_events:
+                try:
+                    events.append(LifeEvent(**raw))
+                except Exception:
+                    continue
+            if events:
+                return ParseResult(
+                    intent=intent,
+                    confidence=0.9,
+                    life_events=events,
+                )
+        return None
+
+    def confirm_pending(
+        self,
+        confirmed: bool = True,
+        now: Optional[datetime] = None,
+    ) -> AgentResult:
+        """显式确认/取消待确认动作（供 UI 按钮、MCP 等直接调用）。"""
+        if now is None:
+            now = datetime.now()
+        if self._pending_action is None:
+            return AgentResult(
+                reply="当前没有待确认的安排。",
+                snapshot=self.current_snapshot,
+                changed=False,
+                intent=ParseIntent.UNKNOWN,
+            )
+        return self._resolve_pending(confirmed=confirmed, now=now)
+
+    def _resolve_pending(
+        self,
+        confirmed: bool,
+        now: datetime,
+    ) -> AgentResult:
+        """执行或取消一条待确认动作。"""
+        action = self._pending_action
+        self._set_pending(None)
+        if action is None:
+            return AgentResult(
+                reply="没有需要确认的安排。",
+                snapshot=self.current_snapshot,
+                changed=False,
+                intent=ParseIntent.UNKNOWN,
+            )
+
+        # 取消
+        if not confirmed:
+            return AgentResult(
+                reply="好的，不安排。需要安排时随时告诉我。",
+                snapshot=self.current_snapshot,
+                changed=False,
+                intent=(
+                    ParseIntent(action.intent)
+                    if action.intent
+                    else ParseIntent.UNKNOWN
+                ),
+            )
+
+        # 执行：优先复用确认前保存的解析结果（稳定、省一次 LLM 调用）
+        parse_result = self._parse_result_from_action(action)
+        if parse_result is None:
+            # 只有原始消息（如闲聊反问"要不要排计划"）→ 带 confirming 提示重新解析
+            parse_context: Dict[str, Any] = {
+                "tasks": [
+                    {"title": t.title, "id": t.id} for t in self._tasks
+                ],
+                "profile_name": self.profile.name,
+                "confirming": True,
+            }
+            parse_result = self.parser.parse(
+                action.message, context=parse_context, now=now
+            )
+
+        # 用户确认后的事件才落地
+        for event in parse_result.life_events:
+            event.user_confirmed = True
+
+        self._apply_parse_result(parse_result, now)
+        need_replan = self._should_replan(parse_result)
+        if need_replan:
+            result = self._do_replan(parse_result, now, action.message)
+        else:
+            result = self._reply_no_change(parse_result, now)
+        self.persist_state()
         return result
 
     # ==========================================
@@ -412,6 +950,9 @@ class LifeAgent:
         elif result.intent == ParseIntent.NEW_EVENT:
             for event in result.life_events:
                 self._apply_event(event, now)
+
+        elif result.intent == ParseIntent.CANCEL_PLAN:
+            self._apply_cancel(result.cancel_data or {})
 
     def _apply_progress_updates(self, records: List[ExecutionRecord]) -> None:
         """应用进度更新。"""
@@ -611,6 +1152,10 @@ class LifeAgent:
 
     def _should_replan(self, result: ParseResult) -> bool:
         """判断是否需要重规划。"""
+        # 取消计划 → 只有真的删掉了东西才需要重排（优先判断，否则会被"无任务"分支拦下）
+        if result.intent == ParseIntent.CANCEL_PLAN:
+            return self._cancel_removed_count > 0
+
         # 没有任何快照但有任务 → 需要首次规划
         if self._tasks and not self._snapshots:
             return True
@@ -626,6 +1171,10 @@ class LifeAgent:
         # 新事件 → 需要
         if result.intent == ParseIntent.NEW_EVENT:
             return True
+
+        # 取消计划 → 只有真的删掉了东西才需要重排
+        if result.intent == ParseIntent.CANCEL_PLAN:
+            return self._cancel_removed_count > 0
 
         # 进度偏差 → 检查是否超过阈值
         if result.intent == ParseIntent.PROGRESS_REPORT:
@@ -691,6 +1240,14 @@ class LifeAgent:
         # 构建回复
         reply = self._build_reply(change_log, schedule_result, parse_result)
 
+        # 取消计划时直接说明"取消了什么"，比调度差异更直观
+        if parse_result.intent == ParseIntent.CANCEL_PLAN and self._cancel_summary:
+            reply = (
+                f"{self._cancel_summary}。"
+                f"\n📊 剩余计划：{len(schedule_result.time_slots)} 个时间段，"
+                f"共 {schedule_result.total_scheduled_minutes} 分钟。"
+            )
+
         return AgentResult(
             reply=reply,
             snapshot=snapshot,
@@ -726,6 +1283,8 @@ class LifeAgent:
 
     def _build_reason(self, parse_result: ParseResult, user_message: str) -> str:
         """构建变更原因。"""
+        if parse_result.intent == ParseIntent.CANCEL_PLAN:
+            return self._cancel_summary or "取消已有安排"
         if parse_result.intent == ParseIntent.NEW_GOAL:
             return f"新增目标：{parse_result.goal_data.get('title', '新目标') if parse_result.goal_data else '新目标'}"
         elif parse_result.intent == ParseIntent.NEW_EVENT:
@@ -759,23 +1318,47 @@ class LifeAgent:
     # 无重规划时的回复
     # ==========================================
 
-    def _reply_general(self, user_message: str, now: datetime) -> AgentResult:
-        """普通闲聊/未命中计划意图时走模型对话，不再返回固定文案。"""
+    def _reply_general(
+        self,
+        user_message: str,
+        now: datetime,
+        history: Optional[List[Dict[str, Any]]] = None,
+    ) -> AgentResult:
+        """普通闲聊/未命中计划意图时走模型对话，不再返回固定文案。
+
+        会携带最近对话（history）一起发给模型，保持多轮语境连贯。
+        """
         llm = self.llm or self.parser.llm or getattr(self.retriever, "llm", None)
         if llm is not None:
             from ..llm.chat_model import ChatMessage, ChatRole
 
             weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
             today_desc = f"{now.strftime('%Y年%m月%d日 %H:%M')}（{weekday_names[now.weekday()]}）"
+
+            # 注入最近对话，让闲聊能接上上下文（"可以/OK"之类才有意义）
             messages = [
                 ChatMessage(
                     ChatRole.SYSTEM,
                     f"你是 LifeOS 的中文学习与时间管理助手。今天是 {today_desc}。"
                     "涉及学生目标、课程、任务、进度时先确认是否需要排计划；"
                     "其他问题正常友好回答。回答简洁自然，不要编造今天的日期。",
-                ),
-                ChatMessage(ChatRole.USER, user_message),
+                )
             ]
+            for h in (history or [])[-6:]:
+                role = h.get("role", "")
+                if role not in ("user", "bot", "assistant"):
+                    continue
+                content = (h.get("content") or "").strip()[:300]
+                if not content:
+                    continue
+                messages.append(
+                    ChatMessage(
+                        ChatRole.USER if role == "user" else ChatRole.ASSISTANT,
+                        content,
+                    )
+                )
+            messages.append(ChatMessage(ChatRole.USER, user_message))
+
             try:
                 response = llm.chat(messages, temperature=0.7, max_tokens=600)
                 content = response.get("content", "").strip()
@@ -784,7 +1367,7 @@ class LifeAgent:
                     if "？" in content and any(
                         kw in content for kw in ("计划", "安排", "目标", "确认")
                     ):
-                        self._pending_confirm = user_message
+                        self._set_pending(PendingAction(message=user_message))
                     return AgentResult(
                         reply=content,
                         snapshot=self.current_snapshot,
@@ -804,18 +1387,75 @@ class LifeAgent:
             intent=ParseIntent.UNKNOWN,
         )
 
+    # 肯定词表：支持整句精确命中，也支持"前缀包含 + 短句"的宽松识别
     _AFFIRMATIVE_REPLIES = {
         "好", "好的", "好呀", "好啊", "好嘞", "好哒", "好滴", "嗯", "嗯嗯",
-        "行", "行的", "可以", "是的", "是", "对", "对的", "要", "需要",
-        "确认", "安排", "ok", "okay", "yes", "没问题", "当然", "当然可以",
-        "麻烦你了", "帮我安排", "这样安排", "就这么办",
+        "行", "行的", "可以", "可以的", "可以啊", "可以的", "好的呀", "行啊",
+        "是的", "是", "对", "对的", "对呀", "要", "需要", "确定",
+        "确认", "安排", "安排吧", "ok", "okay", "ok的", "yes", "yeah",
+        "没问题", "当然", "当然可以", "麻烦你了", "帮我安排", "这样安排",
+        "就这么办", "就这样", "同意", "开始", "开始吧", "快开始吧",
+    }
+
+    # 否定/取消词（先于肯定词判断）
+    _NEGATIVE_WORDS = (
+        "不用", "不需要", "不要", "不安排", "不行", "算了", "取消", "先不了",
+        "以后再说", "再想想", "等等", "别", "不是", "不了", "拒绝",
+        "改一下", "想改", "不用了",
+    )
+    _NEGATIVE_EXACT = {
+        "不", "不排", "不要", "不用", "不行", "取消", "算了", "别", "先不了",
+        "不需要", "no", "不安排",
     }
 
     @classmethod
+    def _normalize_reply(cls, message: str) -> str:
+        """去掉常见标点与空白后的小写文本。"""
+        return (
+            message.strip().lower().strip("。，！？!?~～,.、；;:： \t\n")
+        )
+
+    @classmethod
+    def _is_negative(cls, message: str) -> bool:
+        """判断是否为否定/取消回复。"""
+        text = cls._normalize_reply(message)
+        if not text:
+            return False
+        if text in cls._NEGATIVE_EXACT:
+            return True
+        # 短句包含否定词即视为取消（"不用了先""算了不排了"）
+        return (
+            len(text) <= 16
+            and any(w in text for w in cls._NEGATIVE_WORDS)
+        )
+
+    @classmethod
     def _is_affirmative(cls, message: str) -> bool:
-        """判断是否为简短的肯定回复（用于确认上一轮的待确认意图）。"""
-        text = message.strip().lower().strip("。，！？!?~～,. .")
-        return len(text) <= 10 and text in cls._AFFIRMATIVE_REPLIES
+        """判断是否为肯定回复（用于确认上一轮的待确认意图）。
+
+        相比精确词表，这里支持"可以啊 / OK 好的 / 行，帮我排吧 / 嗯好"等
+        常见变体；同时排除带否定词的表达（如"不用了"）。
+        """
+        text = cls._normalize_reply(message)
+        if not text or len(text) > 20:
+            return False
+        # 明确的否定词优先（"没问题"含"没"但属于肯定，特例处理）
+        if cls._is_negative(text) and text not in ("没问题", "没问题吧"):
+            return False
+        # 1) 精确命中短词
+        if text in cls._AFFIRMATIVE_REPLIES:
+            return True
+        # 2) 前缀包含式：如"可以，帮我排吧""好的没问题""OK 就这么办"
+        if len(text) <= 14:
+            for stem in (
+                "好的", "好呀", "好啊", "好嘞", "可以", "没问题", "当然",
+                "行", "嗯", "对", "ok", "okay", "yes", "要", "确认",
+                "安排", "就这样", "就这么办", "同意", "开始", "麻烦你了",
+                "帮我安排", "好",
+            ):
+                if text.startswith(stem):
+                    return True
+        return False
 
     def _build_confirm_reply(
         self, parse_result: ParseResult, user_message: str
@@ -830,7 +1470,8 @@ class LifeAgent:
             dl_text = f"（截止 {dl}）" if dl else ""
             return (
                 f"我理解你的目标是：{title}{dl_text}。"
-                f"要帮你安排到每日计划里吗？回复「好的」就开始。"
+                "要帮你安排到每日计划里吗？"
+                "同意的话回复「好的 / 可以 / 没问题」，不需要就回复「不用了」。"
             )
         if parse_result.intent == ParseIntent.NEW_EVENT:
             if parse_result.life_events:
@@ -843,7 +1484,15 @@ class LifeAgent:
                 etime_text = ""
             return (
                 f"我记下一个事件：{title}{etime_text}。"
-                f"要把它加入日程并重新安排任务吗？回复「好的」就开始。"
+                "要把它加入日程并重新安排任务吗？"
+                "同意的话回复「好的 / 可以 / 没问题」，不需要就回复「不用了」。"
+            )
+        if parse_result.intent == ParseIntent.CANCEL_PLAN:
+            preview = self._preview_cancel(parse_result.cancel_data or {})
+            return (
+                f"{preview}。"
+                "确认取消吗？取消后我会重新安排剩余时间。"
+                "同意的话回复「好的 / 可以 / 没问题」，不改就回复「不用了」。"
             )
         return "好的，我记下了。"
 
@@ -851,6 +1500,15 @@ class LifeAgent:
         """不需要重规划时的回复。"""
         if parse_result.intent == ParseIntent.STATUS_QUERY:
             return self._reply_status(parse_result, now)
+
+        # 取消了但没匹配到东西：给出提示而不是"记下了"
+        if parse_result.intent == ParseIntent.CANCEL_PLAN:
+            return AgentResult(
+                reply=self._cancel_summary or "没有可取消的内容。",
+                snapshot=self.current_snapshot,
+                changed=False,
+                intent=parse_result.intent,
+            )
 
         return AgentResult(
             reply="好的，我记下了。目前不需要调整计划。",
@@ -1150,11 +1808,23 @@ class LifeAgent:
     # 知识库对话（RAG）
     # ==========================================
 
-    def chat_with_knowledge(self, user_message: str, use_rag: bool = True) -> AgentResult:
+    def chat_with_knowledge(
+        self,
+        user_message: str,
+        use_rag: bool = True,
+        history: Optional[List[Dict[str, Any]]] = None,
+    ) -> AgentResult:
         """带知识库的对话。
 
         对于知识类问题，先检索再回答；对于计划类问题，走正常流程。
         """
+        # 若正在等确认且这条是确认/取消回复，直接走主流程（不要让"可以"被知识库误判）
+        if self._pending_action is not None and (
+            self._is_affirmative(user_message)
+            or self._is_negative(user_message)
+        ):
+            return self.run(user_message, history=history)
+
         # 判断是否需要 RAG
         need_rag = use_rag and self.retriever and self._is_knowledge_query(user_message)
 
@@ -1217,7 +1887,7 @@ class LifeAgent:
                 )
 
         # 不需要 RAG，走正常流程
-        return self.run(user_message)
+        return self.run(user_message, history=history)
 
     def _is_knowledge_query(self, message: str) -> bool:
         """判断是否为知识查询类问题。"""

@@ -24,6 +24,7 @@ class SacrificeGenerator:
         scheduled_hard_tasks: List[Task],
         priority_scores: Dict[str, float],
         now: Optional[datetime] = None,
+        wake_up_hour: int = 7,
     ) -> List[SacrificeItem]:
         """生成牺牲清单。
 
@@ -35,6 +36,7 @@ class SacrificeGenerator:
             scheduled_hard_tasks: 已安排的硬截止任务（牺牲的原因）
             priority_scores: 所有任务的优先级得分
             now: 当前时间
+            wake_up_hour: 用户起床时间（小时），用于判断截止时间是否早于起床时间
 
         Returns:
             牺牲清单（按优先级从低到高排序）
@@ -64,14 +66,36 @@ class SacrificeGenerator:
         sacrifices: List[SacrificeItem] = []
 
         for task in sorted_unscheduled:
-            # 确定牺牲动作
+            # 判断是否因截止时间过早而无法安排（截止时间在起床时间之前或已过）
+            deadline_too_early = False
+            if task.deadline:
+                try:
+                    deadline = datetime.fromisoformat(task.deadline)
+                    # 截止时间已过
+                    if deadline <= now:
+                        deadline_too_early = True
+                        early_reason = "截止时间已过"
+                    # 截止时间在今天，但早于起床时间
+                    elif (deadline.date() == now.date()
+                          and deadline.hour < wake_up_hour):
+                        deadline_too_early = True
+                        early_reason = (
+                            f"截止时间 {deadline.strftime('%H:%M')} "
+                            f"早于起床时间 {wake_up_hour:02d}:00"
+                        )
+                except (ValueError, TypeError):
+                    pass
+
+            # 确定牺牲动作与原因
             if task.deadline_type == DeadlineType.HARD:
                 action = "delayed"
-                # 硬截止任务被牺牲属于严重问题
-                reason = f"{reason_template}（硬截止冲突，需手动调整）"
+                if deadline_too_early:
+                    reason = f"{early_reason}（硬截止，需手动调整）"
+                else:
+                    reason = f"{reason_template}（硬截止冲突，需手动调整）"
             else:
                 action = "delayed"
-                reason = reason_template
+                reason = early_reason if deadline_too_early else reason_template
 
             # 估算推迟到什么时候（简单估算：下一天）
             delayed_to = None

@@ -27,6 +27,7 @@ class ParseIntent(str, Enum):
     NEW_GOAL = "new_goal"                # 新目标
     NEW_EVENT = "new_event"              # 新事件
     STATUS_QUERY = "status_query"        # 状态查询
+    CANCEL_PLAN = "cancel_plan"          # 取消/删除已有计划
     UNKNOWN = "unknown"                  # 无法识别
 
 
@@ -41,6 +42,7 @@ class ParseResult:
     life_events: List[LifeEvent] = field(default_factory=list)
     goal_data: Optional[Dict] = None
     query_type: Optional[str] = None
+    cancel_data: Optional[Dict] = None
 
     raw_response: Dict = field(default_factory=dict)
 
@@ -49,7 +51,7 @@ SYSTEM_PROMPT = """你是 LifeOS 的输入解析器。你的任务是将用户�
 
 请严格按以下 JSON 格式输出：
 {
-  "intent": "progress_report | new_goal | new_event | status_query | unknown",
+  "intent": "progress_report | new_goal | new_event | status_query | cancel_plan | unknown",
   "confidence": 0.0-1.0,
   "data": { ... }
 }
@@ -103,7 +105,23 @@ SYSTEM_PROMPT = """你是 LifeOS 的输入解析器。你的任务是将用户�
      "query_type": "progress | plan | risk | all"
    }
 
-5. unknown（无法识别）：
+5. cancel_plan（取消已有计划/目标/任务/安排）：
+   - 当用户说"取消…计划"、"删除…任务"、"别安排…"、"清空所有计划"等时触发
+   - data 格式：
+   {
+     "target_type": "goal | task | commitment | date | all",
+     "keyword": "要取消的对象名称关键词，如'高数'；用户没给出名称时为空字符串",
+     "date": "YYYY-MM-DD 或 null（只取消某一天的全部安排时才填）"
+   }
+   - target_type 取值说明：
+     - goal：取消某个目标（会连带删除它分解出的任务）
+     - task：取消某个/某些任务
+     - commitment：取消课表或固定安排
+     - date：取消 date 指定那天的全部安排
+     - all：清空所有目标与任务
+   - 关键词必须来自用户原话，禁止编造；用户没说清是哪个计划时 keyword 留空、target_type 用 goal
+
+6. unknown（无法识别）：
    - data 为空对象 {}
 
 注意：
@@ -115,6 +133,17 @@ SYSTEM_PROMPT = """你是 LifeOS 的输入解析器。你的任务是将用户�
   - new_goal 的 deadline 输出 "YYYY-MM-DD"
   - new_event 的 event_time 输出 "YYYY-MM-DD HH:MM"（24小时制），能推断到具体时刻就给具体时刻，推断不到时刻就只给 "YYYY-MM-DD"
 - 一条消息同时提到目标和当前进度时（如"X日前要交Y，已经做了一半"），归类为 new_goal，进度信息留待后续汇报
+- 目标/事件标题必须忠实用户原话或上下文中已有的内容，禁止编造用户没提到的具体事项。
+  例如用户说"八点去学习"，标题只能是"学习"这类原话词，绝不能臆造成"打篮球/打球"等。
+- "去学习/复习/写作业/背单词"这类用户给自己安排的任务时间点，不是一次性外部活动（activity/event）；
+  如果句中同时给出了要做的事和时间点（如"八点去学习英语"、"今晚复习高数"），归类为 new_goal，
+  title 取活动内容（如"学习英语"、"复习高数"），deadline/event_time 按给出的时间换算；
+  只有既没说做什么、也没说时间（如单纯"去学习"）才输出 unknown，不要虚构事件。
+- 消息中没给出的信息（如 event_time、deadline）一律留空，禁止猜测或脑补。
+- 用户明确说要"取消/删除/去掉/别安排/停掉"某个计划、目标、任务或安排时，归类为 cancel_plan，
+  不要当成 status_query（即使句子里有"计划""安排"等词），也不要当成 new_goal。
+- 用户说"不去/不去…了/不参加/不用去"某活动（如"八点不去打篮球了"）同样是取消意图（cancel_plan）：
+  keyword 填活动名（如"打篮球"）。这绝不是 new_event，绝不能把它作为新事件加进日程。
 """
 
 
@@ -166,6 +195,16 @@ class InputParser:
         if now is None:
             now = datetime.now()
 
+        # 取消类语句优先用确定性规则识别，避免被"我要取消…"误判成新目标、
+        # 或被"…计划"字样误判成状态查询
+        cancel_data = self._parse_cancel_request(user_message, now=now)
+        if cancel_data is not None:
+            return ParseResult(
+                intent=ParseIntent.CANCEL_PLAN,
+                confidence=0.8,
+                cancel_data=cancel_data,
+            )
+
         # 明确的目标句优先走确定性规则，避免模型误判成“事件”
         if self._is_explicit_goal_phrase(user_message):
             return self._rule_based_parse(user_message, now=now)
@@ -176,9 +215,24 @@ class InputParser:
 
         # 构建上下文提示
         context_prompt = ""
+        if context and context.get("profile_name"):
+            context_prompt += f"\n用户姓名：{context['profile_name']}"
         if context and context.get("tasks"):
             task_titles = [t["title"] for t in context["tasks"][:5]]
-            context_prompt = f"\n当前任务列表：{', '.join(task_titles)}"
+            context_prompt += f"\n当前任务列表：{', '.join(task_titles)}"
+        if context and context.get("history"):
+            rows = []
+            for h in context["history"][:8]:
+                role = "用户" if h.get("role") in ("user", "用户") else "助手"
+                content = (h.get("content") or "").strip()
+                if not content:
+                    continue
+                rows.append(f"{role}：{content[:150]}")
+            if rows:
+                context_prompt += (
+                    "\n\n最近对话（仅供理解语境，当前用户消息才是唯一需要解析的对象）：\n"
+                    + "\n".join(rows)
+                )
         if context and context.get("confirming"):
             context_prompt += (
                 "\n注意：这是用户对上一条消息的确认回复，请把上面的消息归类为最具体的意图"
@@ -284,6 +338,18 @@ class InputParser:
 
         elif intent == ParseIntent.STATUS_QUERY:
             result.query_type = _clean_str(data.get("query_type"), "all")
+
+        elif intent == ParseIntent.CANCEL_PLAN:
+            target_type = _clean_str(data.get("target_type"), "goal")
+            if target_type not in ("goal", "task", "commitment", "date", "all"):
+                target_type = "goal"
+            raw_date = data.get("date")
+            result.cancel_data = {
+                "target_type": target_type,
+                "keyword": _clean_str(data.get("keyword")),
+                "date": raw_date if isinstance(raw_date, str) and raw_date.strip() else None,
+                "raw": _clean_str(data.get("raw")),
+            }
 
         return result
 
@@ -428,6 +494,87 @@ class InputParser:
 
         return None
 
+    # 取消意图相关的确定性词表
+    _CANCEL_VERBS = (
+        "取消", "删除", "去掉", "撤掉", "撤回", "移除", "清空", "别安排",
+        "不用安排", "不要安排", "不安排", "停掉", "终止", "不要了",
+        # 否定式：说"不去/不参加某活动"同样是在取消，而不是新增
+        "不去", "不要去", "不用去", "不参加", "不去了",
+    )
+    # 这类否定式动词本身就足以表意，不要求句中出现"计划/任务"等名词
+    _CANCEL_STRONG_VERBS = ("不去", "不要去", "不用去", "不参加", "不去了")
+    _CANCEL_NOUNS = ("计划", "目标", "任务", "安排", "日程", "备考", "课", "课程", "课表")
+    _CANCEL_STOPWORDS = (
+        "帮我", "帮我把", "请", "把", "的", "了", "吧", "这个", "那个", "一下",
+        "我", "要", "想", "给我", "所有", "全部", "今天", "明天", "后天", "当天",
+    )
+    # 剥离时间表达，让关键词更接近活动名（"八点打篮球" → "打篮球"）
+    _TIME_WORDS_RE = re.compile(
+        r"\d{1,2}[点:：]\d{0,2}分?\d{0,2}"
+        r"|\d{1,2}点(?:半)?"
+        r"|[一二两三四五六七八九十]+点(?:半)?"
+        r"|早上|上午|中午|下午|傍晚|晚上|今晚|明晚|今早|明早"
+    )
+
+    def _parse_cancel_request(
+        self,
+        user_message: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """识别"取消/删除计划"类语句，返回 cancel_data；不是则返回 None。"""
+        msg = user_message.strip()
+        if not msg:
+            return None
+
+        verb = next((v for v in self._CANCEL_VERBS if v in msg), None)
+        if verb is None:
+            return None
+        # "不去/不参加…"本身就是明确取消；其余动词必须提到被取消的对象
+        if (
+            verb not in self._CANCEL_STRONG_VERBS
+            and not any(n in msg for n in self._CANCEL_NOUNS)
+        ):
+            return None
+
+        rest = msg
+        for v in self._CANCEL_VERBS:
+            rest = rest.replace(v, " ")
+
+        # 目标类型判定：整体清空 > 课表 > 任务 > 目标/计划
+        if any(w in msg for w in ("所有计划", "全部计划", "所有目标", "全部目标",
+                                  "所有任务", "全部任务", "清空")):
+            target_type = "all"
+        elif any(w in rest for w in ("课表", "课程", "上课", "的课")):
+            target_type = "commitment"
+        elif "任务" in rest:
+            target_type = "task"
+        elif any(w in rest for w in ("目标", "计划", "备考")):
+            target_type = "goal"
+        else:
+            # 否定式活动（"不去打篮球了"）按关键词取消，落到 goal/task 兜底匹配
+            target_type = "goal"
+
+        # 取消某一天的全部安排
+        date_str = None
+        if any(w in msg for w in ("今天", "明天", "后天", "当天")):
+            target_type = "date"
+            parsed = self._parse_deadline(msg, now=now) if now is not None else None
+            date_str = parsed[:10] if isinstance(parsed, str) else None
+
+        # 提取关键词：剥掉动词、对象名词、口语停用词和时间表达
+        keyword = rest
+        for w in set(self._CANCEL_NOUNS) | set(self._CANCEL_STOPWORDS):
+            keyword = keyword.replace(w, " ")
+        keyword = self._TIME_WORDS_RE.sub(" ", keyword)
+        keyword = re.sub(r"[\s，。、！？,.!?~～]+", "", keyword).strip()
+
+        return {
+            "target_type": target_type,
+            "keyword": keyword,
+            "date": date_str,
+            "raw": msg,
+        }
+
     def _rule_based_parse(
         self,
         user_message: str,
@@ -435,6 +582,15 @@ class InputParser:
     ) -> ParseResult:
         """基于规则的兜底解析（Mock 模式使用）。"""
         msg = user_message.lower()
+
+        # 取消计划检测（必须放在状态查询之前，避免"取消…计划"被当成查询）
+        cancel_data = self._parse_cancel_request(user_message, now=now)
+        if cancel_data is not None:
+            return ParseResult(
+                intent=ParseIntent.CANCEL_PLAN,
+                confidence=0.75,
+                cancel_data=cancel_data,
+            )
 
         # 状态查询检测（先于进度汇报，因为"进度如何"是查询不是汇报）
         if any(w in user_message for w in ["怎么样", "如何", "看看", "状态", "进度如何", "计划", "情况"]):

@@ -2,7 +2,7 @@
 
 from .profile import StudentProfile, Commitment, EnergyLevel, CommitmentType, RecurrenceType
 from .goal import Goal, Task, DeadlineType, TaskStatus
-from .schedule import TimeSlot, PlanSnapshot, ChangeLog, SacrificeItem
+from .schedule import TimeSlot, PlanSnapshot, ChangeLog, ChangeLogItem, SacrificeItem
 from .event import LifeEvent, ExecutionRecord, EventType
 from .risk import RiskReport, RiskLevel, RiskSuggestionType
 
@@ -19,6 +19,7 @@ __all__ = [
     "TimeSlot",
     "PlanSnapshot",
     "ChangeLog",
+    "ChangeLogItem",
     "SacrificeItem",
     "LifeEvent",
     "ExecutionRecord",
