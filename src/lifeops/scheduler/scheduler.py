@@ -400,8 +400,19 @@ class Scheduler:
         placed_any = False
 
         # 计算每个可用槽的"适合度"：精力匹配 + 时间顺序
+        # 若任务有 earliest_start_time，跳过早于该时间的可用槽
+        earliest_start: Optional[datetime] = None
+        if getattr(task, "earliest_start_time", None):
+            try:
+                earliest_start = datetime.fromisoformat(task.earliest_start_time)
+            except (ValueError, TypeError):
+                earliest_start = None
+
         scored_slots = []
         for slot in available_slots:
+            # 跳过早于任务最早开始时间的槽（"明天做X"不应排到今天）
+            if earliest_start is not None and slot.end <= earliest_start:
+                continue
             energy_score = self.checker.energy_match_score(
                 task.energy_level, slot.energy_level
             )

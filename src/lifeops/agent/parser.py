@@ -334,6 +334,11 @@ class InputParser:
             elif not self._is_iso_date(str(deadline)):
                 deadline = self._parse_deadline(str(deadline), now=now)
             goal_data["deadline"] = deadline
+            # 提取最早开始日期（"明天做X" → 明天才开始安排）
+            # 必须从用户原话提取，因为 LLM 可能把"明天"换算成具体日期
+            # 放进 deadline 字段，而 description 里可能不再包含"明天"一词
+            start_date = self._parse_start_date(user_message, now=now)
+            goal_data["start_date"] = start_date
             result.goal_data = goal_data
 
         elif intent == ParseIntent.STATUS_QUERY:
@@ -494,6 +499,22 @@ class InputParser:
 
         return None
 
+    def _parse_start_date(
+        self,
+        text: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """从中文日期表达中提取「最早开始日期」。
+
+        专门用于识别用户说的"明天/后天/下周X…做 Y"里的时间词，
+        表示任务最早从那一天开始才能安排，避免被排到今天。
+
+        与 _parse_deadline 的区别：_parse_deadline 把日期当作截止时间；
+        _parse_start_date 把日期当作最早开始时间。两者解析逻辑相同，
+        只是调用方赋值给 goal_data 的不同字段。
+        """
+        return self._parse_deadline(text, now=now)
+
     # 取消意图相关的确定性词表
     _CANCEL_VERBS = (
         "取消", "删除", "去掉", "撤掉", "撤回", "移除", "清空", "别安排",
@@ -640,13 +661,16 @@ class InputParser:
 
         # 新目标检测
         if any(w in msg for w in ["我要", "我想", "准备", "目标是", "开始"]):
+            deadline = self._parse_deadline(user_message, now=now)
+            start_date = self._parse_start_date(user_message, now=now)
             return ParseResult(
                 intent=ParseIntent.NEW_GOAL,
                 confidence=0.6,
                 goal_data={
                     "title": self._clean_goal_title(user_message),
                     "description": user_message,
-                    "deadline": self._parse_deadline(user_message, now=now),
+                    "deadline": deadline,
+                    "start_date": start_date,
                     "weight": 0.5,
                 },
             )

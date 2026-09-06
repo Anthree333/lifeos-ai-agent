@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     energy_level TEXT NOT NULL DEFAULT 'medium',
     deadline_type TEXT NOT NULL DEFAULT 'soft',
     deadline TEXT,
+    earliest_start_time TEXT,
     priority_weight REAL NOT NULL DEFAULT 0.5,
     progress REAL NOT NULL DEFAULT 0.0,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -250,7 +251,20 @@ class Database:
     def init_schema(self) -> None:
         """初始化数据库表结构。"""
         self.conn.executescript(SCHEMA_SQL)
+        # 轻量列迁移：旧库可能缺少 earliest_start_time 列
+        self._ensure_column("tasks", "earliest_start_time", "TEXT")
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, col_type: str) -> None:
+        """如果列不存在则添加（兼容旧数据库）。"""
+        cols = {
+            row[1]
+            for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in cols:
+            self.conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+            )
 
     def close(self) -> None:
         if self._conn:
@@ -444,9 +458,10 @@ class Database:
             """INSERT OR REPLACE INTO tasks
                (id, goal_id, parent_id, title, description, estimated_minutes,
                 actual_minutes, energy_level, deadline_type, deadline,
+                earliest_start_time,
                 priority_weight, progress, status, dependencies, order_index,
                 created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.id,
                 task.goal_id,
@@ -458,6 +473,7 @@ class Database:
                 task.energy_level.value if hasattr(task.energy_level, 'value') else task.energy_level,
                 task.deadline_type.value if hasattr(task.deadline_type, 'value') else task.deadline_type,
                 task.deadline,
+                getattr(task, 'earliest_start_time', None),
                 task.priority_weight,
                 task.progress,
                 task.status.value if hasattr(task.status, 'value') else task.status,
@@ -508,6 +524,7 @@ class Database:
             energy_level=row["energy_level"],
             deadline_type=row["deadline_type"],
             deadline=row["deadline"],
+            earliest_start_time=row["earliest_start_time"] if "earliest_start_time" in row.keys() else None,
             priority_weight=row["priority_weight"],
             progress=row["progress"],
             status=row["status"],

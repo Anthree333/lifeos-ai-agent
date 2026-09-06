@@ -50,6 +50,7 @@ class Task(BaseModel):
     energy_level: EnergyLevel = EnergyLevel.MEDIUM
     deadline_type: DeadlineType = DeadlineType.SOFT
     deadline: Optional[str] = None  # ISO datetime string
+    earliest_start_time: Optional[str] = None  # 最早可安排时间（ISO datetime string）
     priority_weight: float = 0.5  # 0-1，任务自身优先级
     progress: float = 0.0  # 0-1
     status: TaskStatus = TaskStatus.PENDING

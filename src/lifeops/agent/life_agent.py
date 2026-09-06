@@ -1045,12 +1045,29 @@ class LifeAgent:
 
         tasks = self.decomposer.decompose(goal, deadline=deadline)
 
+        # 用户提到"明天/后天/下周…"等相对时间时，解析器会把它放进
+        # goal_data["start_date"]（YYYY-MM-DD），表示任务最早从那一天开始
+        # 才能安排——避免"明天做X"被排到今天。
+        start_date_str = goal_data.get("start_date")
+        earliest_dt: Optional[datetime] = None
+        if start_date_str:
+            try:
+                # 当天 00:00 起，允许安排到那一天的任意时段
+                earliest_dt = datetime.fromisoformat(
+                    start_date_str + "T00:00:00"
+                )
+            except (ValueError, TypeError):
+                earliest_dt = None
+
         # 分配真实 ID 并解析依赖
         id_map: Dict[str, str] = {}
         for i, task in enumerate(tasks):
             new_id = f"task_{uuid.uuid4().hex[:8]}"
             id_map[f"__idx_{i}"] = new_id
             task.id = new_id
+            # 继承目标级别的最早开始时间
+            if earliest_dt is not None:
+                task.earliest_start_time = earliest_dt.isoformat()
 
         # 替换依赖占位符
         for task in tasks:

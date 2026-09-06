@@ -1093,6 +1093,9 @@ def _unscheduled_active_tasks(agent, snapshot) -> list:
 
     同时包含刚被标记完成的任务（session_state 中记录），
     以便显示撤销入口，避免误点完成后无法回退。
+
+    排除 earliest_start_time 在明天及以后的任务——
+    "明天做X"不应出现在今日计划的待安排区域。
     """
     scheduled_task_ids = set()
     if snapshot and snapshot.time_slots:
@@ -1106,10 +1109,22 @@ def _unscheduled_active_tasks(agent, snapshot) -> list:
         if tid.startswith("unsched_done_") and done
     }
 
+    from datetime import datetime as _dt
+    today_end = _dt.now().replace(hour=23, minute=59, second=59)
+
     result = []
     for t in agent._tasks:
         if t.id in scheduled_task_ids:
             continue
+        # 跳过今天还不能开始的任务（earliest_start_time 在明天及以后）
+        est = getattr(t, "earliest_start_time", None)
+        if est:
+            try:
+                est_dt = _dt.fromisoformat(est)
+                if est_dt > today_end:
+                    continue
+            except (ValueError, TypeError):
+                pass
         if t.status.value in ("pending", "in_progress"):
             result.append(t)
         elif f"unsched_done_{t.id}" in just_done_ids:
@@ -1127,11 +1142,40 @@ def _task_deadline_date(task):
         return None
 
 
+def _finish_unsched_task(agent, task):
+    """完成一个待安排任务并触发重排，让牺牲清单同步调整。
+
+    完成后该任务不再参与调度，释放出的时间可能让之前被牺牲的
+    任务重新获得安排机会，因此需要 force_replan 生成新快照。
+    """
+    agent.complete_task(task.id)
+    st.session_state[f"unsched_done_{task.id}"] = True
+    try:
+        agent.force_replan(reason=f"完成待安排任务：{task.title}")
+    except Exception:
+        pass
+
+
+def _undo_unsched_task(agent, task):
+    """撤销完成的待安排任务并触发重排。
+
+    撤销后任务恢复为进行中，重新参与调度，可能导致部分任务
+    再次被牺牲，因此同样需要 force_replan 更新牺牲清单。
+    """
+    agent.uncomplete_task(task.id)
+    st.session_state[f"unsched_done_{task.id}"] = False
+    try:
+        agent.force_replan(reason=f"撤销完成：{task.title}")
+    except Exception:
+        pass
+
+
 def _render_unscheduled_task_row(agent, task, key_prefix: str, compact: bool = False):
     """渲染一条带完成按钮的待安排任务，支持误点后撤销。
 
     完成后任务不会立即从列表消失，而是变为已完成样式并显示「撤销」按钮，
     点击撤销调用 uncomplete_task 恢复为待开始状态。
+    完成/撤销都会触发重排，让「暂时搁置的任务」清单同步调整。
     """
     # 该任务是否刚被标记完成（用于显示撤销入口）
     done_key = f"unsched_done_{task.id}"
@@ -1161,8 +1205,7 @@ def _render_unscheduled_task_row(agent, task, key_prefix: str, compact: bool = F
             with c_btn:
                 if st.button("↩", key=f"{key_prefix}_undo_{task.id}",
                              help="撤销完成", use_container_width=True):
-                    agent.uncomplete_task(task.id)
-                    st.session_state[done_key] = False
+                    _undo_unsched_task(agent, task)
                     st.rerun()
         else:
             c_card, c_btn = st.columns([5, 1])
@@ -1180,8 +1223,7 @@ def _render_unscheduled_task_row(agent, task, key_prefix: str, compact: bool = F
             with c_btn:
                 if st.button("↩ 撤销", key=f"{key_prefix}_undo_{task.id}",
                              help="撤销完成，恢复为待开始", use_container_width=True):
-                    agent.uncomplete_task(task.id)
-                    st.session_state[done_key] = False
+                    _undo_unsched_task(agent, task)
                     st.rerun()
         return
 
@@ -1200,8 +1242,7 @@ def _render_unscheduled_task_row(agent, task, key_prefix: str, compact: bool = F
         with c_btn:
             if st.button("☐", key=f"{key_prefix}_{task.id}",
                          help=f"标记完成：{task.title}", use_container_width=True):
-                agent.complete_task(task.id)
-                st.session_state[done_key] = True
+                _finish_unsched_task(agent, task)
                 st.rerun()
     else:
         c_card, c_btn = st.columns([5, 1])
@@ -1219,8 +1260,7 @@ def _render_unscheduled_task_row(agent, task, key_prefix: str, compact: bool = F
         with c_btn:
             if st.button("☐ 完成", key=f"{key_prefix}_{task.id}",
                          help=f"标记完成：{task.title}", use_container_width=True):
-                agent.complete_task(task.id)
-                st.session_state[done_key] = True
+                _finish_unsched_task(agent, task)
                 st.rerun()
 
 
@@ -1350,6 +1390,840 @@ NAV_VIEWS = {
 }
 
 
+def render_schedule_view() -> None:
+    """日程视图：概览 / 今日计划 / 任务看板 / 历史快照 四个 Tab（仅日程页显示）。"""
+    agent: LifeAgent = st.session_state.agent
+    db = get_db()
+    profile = st.session_state.profile
+    snapshot = agent.current_snapshot
+    sacrifice_count = len(snapshot.sacrifice_list) if snapshot else 0
+
+    # ==========================================
+    # Tab 切换
+    # ==========================================
+    tab_dashboard, tab_plan, tab_tasks, tab_history = st.tabs([
+        "  📊  概览  ",
+        "  📅  今日计划  ",
+        "  📋  任务看板  ",
+        "  📜  历史快照  ",
+    ])
+
+
+    # ==========================================
+    # Tab 1: 概览仪表盘
+    # ==========================================
+    with tab_dashboard:
+        left_col, right_col = st.columns([2, 1])
+
+        with left_col:
+            st.markdown("#### 📅 今日安排")
+
+            today = date.today()
+            if snapshot and snapshot.time_slots:
+                today_slots = [
+                    ts for ts in snapshot.time_slots
+                    if ts.start_time.startswith(str(today))
+                ]
+
+                if today_slots:
+                    st.markdown('<div class="timeline-container">', unsafe_allow_html=True)
+                    for idx, ts in enumerate(today_slots[:8]):
+                        start = ts.start_time.split("T")[1][:5]
+                        end = ts.end_time.split("T")[1][:5]
+                        duration = int((datetime.fromisoformat(ts.end_time)
+                                      - datetime.fromisoformat(ts.start_time)).total_seconds() / 60)
+
+                        src = ts.source.value if hasattr(ts.source, 'value') else ts.source
+                        task = agent.get_task(ts.task_id) if ts.task_id else None
+                        title = task.title if task else ts.title or "安排"
+                        energy = task.energy_level.value if task and task.energy_level else "medium"
+                        # 完成状态：与「今日计划」共用同一 session_state key
+                        done_key = f"plan_done_{ts.id or ts.task_id or idx}"
+                        show_done = bool(
+                            (task and task.status.value == "completed")
+                            or st.session_state.get(done_key)
+                        )
+
+                        # 圆点颜色（已完成统一绿色）
+                        if show_done:
+                            dot_color = "#16a34a"
+                            card_class = "task"
+                        elif src == "commitment":
+                            dot_color = "#f59e0b"
+                            card_class = "commitment"
+                        elif src == "buffer":
+                            dot_color = "#94a3b8"
+                            card_class = "buffer"
+                        else:
+                            dot_color = "#6366f1"
+                            card_class = "task"
+
+                        if show_done:
+                            st.markdown(
+                                '<div class="timeline-item" style="animation-delay:'
+                                f' {idx * 0.05}s;">'
+                                f'<div class="timeline-time">{start}</div>'
+                                '<div class="timeline-dot" style="background:#16a34a;"></div>'
+                                '<div class="timeline-card" style="background:#f0fdf4;border-left:3px solid rgba(22,163,74,0.45);">'
+                                f'<div class="timeline-title" style="text-decoration:line-through;color:#86efac;">{title}</div>'
+                                '<div class="timeline-meta">⏱ '
+                                f'{duration} 分钟 · <span style="color:#16a34a;font-weight:600">✓ 已完成</span>'
+                                '</div></div></div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                '<div class="timeline-item" style="animation-delay:'
+                                f' {idx * 0.05}s;">'
+                                f'<div class="timeline-time">{start}</div>'
+                                f'<div class="timeline-dot" style="background:{dot_color};"></div>'
+                                f'<div class="timeline-card {card_class}">'
+                                f'<div class="timeline-title">{title}</div>'
+                                f'<div class="timeline-meta">⏱ {duration} 分钟'
+                                f'{" · 🔴硬截止" if task and task.deadline_type.value == "hard" else ""}'
+                                f'{" · " + energy_icon(energy) if task else ""}'
+                                '</div></div></div>',
+                                unsafe_allow_html=True,
+                            )
+
+                    if len(today_slots) > 8:
+                        st.markdown(f"""
+                        <div style="text-align:center; padding:10px 0 4px; color:#94a3b8; font-size:0.78rem;
+                                    cursor:pointer; transition: color 0.2s;" onmouseover="this.style.color='#64748b'">
+                            还有 {len(today_slots) - 8} 个安排 → 切换到「今日计划」查看全部
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+                    # 今日截止但未安排的活跃任务（日期对得上则补显到概览）
+                    _unsched_today = [
+                        t for t in _unscheduled_active_tasks(agent, snapshot)
+                        if _task_deadline_date(t) == today
+                    ]
+                    if _unsched_today:
+                        st.markdown(
+                            "<div style='margin-top:10px; font-size:0.8rem; color:#d97706; font-weight:600;'>"
+                            "📌 今日截止 · 待安排</div>",
+                            unsafe_allow_html=True,
+                        )
+                        for t in _unsched_today:
+                            _render_unscheduled_task_row(agent, t, "dash_today", compact=True)
+                else:
+                    # 今天没有已安排时间槽，检查是否有今日截止的未安排任务
+                    _unsched_today = [
+                        t for t in _unscheduled_active_tasks(agent, snapshot)
+                        if _task_deadline_date(t) == today
+                    ]
+                    if _unsched_today:
+                        st.markdown(
+                            "<div style='font-size:0.8rem; color:#d97706; font-weight:600; margin-bottom:8px;'>"
+                            "📌 今日截止 · 待安排</div>",
+                            unsafe_allow_html=True,
+                        )
+                        for t in _unsched_today:
+                            _render_unscheduled_task_row(agent, t, "dash_empty", compact=True)
+                    else:
+                        st.markdown("""
+                        <div class="empty-state">
+                            <div class="empty-state-icon">🌅</div>
+                            <div class="empty-state-text">今天还没有安排</div>
+                            <div class="empty-state-sub">在下方聊天框设定你的第一个目标吧</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+            else:
+                # 没有快照时，检查是否有今日截止的未安排任务
+                _unsched_today = [
+                    t for t in _unscheduled_active_tasks(agent, snapshot)
+                    if _task_deadline_date(t) == today
+                ]
+                if _unsched_today:
+                    st.markdown(
+                        "<div style='font-size:0.8rem; color:#d97706; font-weight:600; margin-bottom:8px;'>"
+                        "📌 今日截止 · 待安排</div>",
+                        unsafe_allow_html=True,
+                    )
+                    for t in _unsched_today:
+                        _render_unscheduled_task_row(agent, t, "dash_nosnap", compact=True)
+                else:
+                    st.markdown("""
+                    <div class="empty-state">
+                        <div class="empty-state-icon">🎯</div>
+                        <div class="empty-state-text">还没有计划</div>
+                        <div class="empty-state-sub">告诉我你的目标，我来帮你安排</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+        with right_col:
+            # 风险提示（完成进度与任务分布已移至侧栏）
+            if sacrifice_count > 0:
+                st.markdown("#### ⚠️ 需要关注")
+                for s in (snapshot.sacrifice_list if snapshot else [])[:3]:
+                    st.markdown(f"""
+                    <div class="sacrifice-card">
+                        <div class="sacrifice-title">{s.task_title}</div>
+                        <div class="sacrifice-reason">{s.reason}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+
+    # ==========================================
+    # Tab 2: 今日计划（时间轴）
+    # ==========================================
+    with tab_plan:
+        _render_delete_notice()
+        col_date, _ = st.columns([1, 3])
+        with col_date:
+            selected_date = st.date_input(
+                "选择日期",
+                value=st.session_state.current_date,
+                label_visibility="collapsed",
+                key="plan_date_tab",
+            )
+        st.session_state.current_date = selected_date
+
+        date_title = selected_date.strftime("%Y年%m月%d日")
+        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        weekday = weekday_names[selected_date.weekday()]
+
+        st.markdown(f"""
+        <div class="date-header">
+            <div>
+                <div class="date-title">{date_title} · {weekday}</div>
+                <div class="date-subtitle">今日学习计划</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if snapshot and snapshot.time_slots:
+            day_slots = [
+                ts for ts in snapshot.time_slots
+                if ts.start_time.startswith(str(selected_date))
+            ]
+
+            if day_slots:
+                # 统计
+                task_minutes = sum(
+                    int((datetime.fromisoformat(ts.end_time) - datetime.fromisoformat(ts.start_time)).total_seconds() / 60)
+                    for ts in day_slots
+                    if (ts.source.value if hasattr(ts.source, 'value') else ts.source) == "task"
+                )
+                commitment_count = sum(
+                    1 for ts in day_slots
+                    if (ts.source.value if hasattr(ts.source, 'value') else ts.source) == "commitment"
+                )
+                st.markdown(f"""
+                <div style="display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap;">
+                    <div style="background:linear-gradient(135deg, #eff6ff, #dbeafe); padding:7px 14px; border-radius:20px; font-size:0.78rem; color:#1d4ed8; font-weight:500;">
+                        📚 学习 {task_minutes} 分钟
+                    </div>
+                    <div style="background:linear-gradient(135deg, #f0fdf4, #dcfce7); padding:7px 14px; border-radius:20px; font-size:0.78rem; color:#16a34a; font-weight:500;">
+                        📝 共 {len(day_slots)} 个安排
+                    </div>
+                    {f'<div style="background:linear-gradient(135deg, #fffbeb, #fef3c7); padding:7px 14px; border-radius:20px; font-size:0.78rem; color:#d97706; font-weight:500;">📌 {commitment_count} 个承诺</div>' if commitment_count > 0 else ''}
+                </div>
+                """, unsafe_allow_html=True)
+
+                # 时间轴（纯 Streamlit 原生行布局，不混用 HTML columns）
+                for idx, ts in enumerate(day_slots):
+                    start = ts.start_time.split("T")[1][:5]
+                    end = ts.end_time.split("T")[1][:5]
+                    duration = int((datetime.fromisoformat(ts.end_time)
+                                  - datetime.fromisoformat(ts.start_time)).total_seconds() / 60)
+
+                    src = ts.source.value if hasattr(ts.source, 'value') else ts.source
+                    task = agent.get_task(ts.task_id) if ts.task_id else None
+                    title = task.title if task else ts.title or "安排"
+                    energy = task.energy_level.value if task and task.energy_level else "medium"
+                    # 完成状态：task.status 优先，session_state 兜底
+                    is_done = bool(task and task.status.value == "completed")
+                    done_key = f"plan_done_{ts.id or ts.task_id or idx}"
+                    is_done_local = done_key in st.session_state and st.session_state[done_key]
+                    show_done = is_done or is_done_local
+
+                    if src == "commitment":
+                        dot_color = "#f59e0b"
+                        card_border = "rgba(245,158,11,0.35)"
+                    elif src == "buffer":
+                        dot_color = "#94a3b8"
+                        card_border = "rgba(148,163,184,0.35)"
+                        title = "☕ 休息缓冲"
+                    else:
+                        dot_color = "#6366f1"
+                        card_border = "rgba(99,102,241,0.35)"
+
+                    # 标签
+                    tag_strs = []
+                    if task and task.deadline_type.value == "hard":
+                        tag_strs.append("🔴 硬截止")
+                    if task:
+                        tag_strs.append(f"{energy_icon(energy)} {energy}")
+                    tag_line = " · ".join(tag_strs)
+
+                    # 行布局：时间 | 圆点+卡片 | 完成 | 删除
+                    _c_time, _c_dot, _c_card, _c_done, _c_del = st.columns(
+                        [1.2, 0.15, 5.5, 1.3, 1.1]
+                    )
+                    with _c_time:
+                        st.markdown(f"<div style='color:#64748b;font-size:0.78rem;text-align:center;padding-top:6px;white-space:nowrap'>{start}<br>—<br>{end}</div>", unsafe_allow_html=True)
+                    with _c_dot:
+                        st.markdown(f"<div style='width:10px;height:10px;border-radius:50%;background:{dot_color};margin-top:14px;margin-left:4px;'></div>", unsafe_allow_html=True)
+                    with _c_card:
+                        if show_done:
+                            st.markdown(f"""
+                            <div style="border-left:3px solid rgba(22,163,74,0.45);padding:6px 12px;margin-bottom:4px;border-radius:0 8px 8px 0;background:#f0fdf4;">
+                                <div style="font-weight:600;text-decoration:line-through;color:#86efac;font-size:0.9rem;">{title}</div>
+                                <div style="font-size:0.72rem;color:#64748b;margin-top:2px;">⏱ {duration} 分钟{f' · {tag_line}' if tag_line else ''}</div>
+                                <div style="color:#16a34a;font-size:0.72rem;font-weight:600;margin-top:2px;">✓ 已完成（再点一次可取消）</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"""
+                            <div style="border-left:3px solid {card_border};padding:6px 12px;margin-bottom:4px;border-radius:0 8px 8px 0;background:{'#eef2ff' if src=='task' else '#fff7ed' if src=='commitment' else '#f8fafc'};">
+                                <div style="font-weight:600;font-size:0.9rem;">{title}</div>
+                                <div style="font-size:0.72rem;color:#64748b;margin-top:2px;">⏱ {duration} 分钟{f' · {tag_line}' if tag_line else ''}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    with _c_done:
+                        if src == "task":
+                            if show_done:
+                                if st.button("✓", key=f"{done_key}_btn", help="点击取消完成",
+                                             use_container_width=True):
+                                    st.session_state[done_key] = False
+                                    if task is not None:
+                                        agent.uncomplete_task(task.id)
+                                    st.rerun()
+                            else:
+                                if st.button("☐", key=f"{done_key}_btn",
+                                             help="标记完成", use_container_width=True):
+                                    st.session_state[done_key] = True
+                                    if task is not None:
+                                        agent.complete_task(task.id)
+                                    st.rerun()
+                        else:
+                            st.markdown("<div style='height:40px'></div>", unsafe_allow_html=True)
+
+                    with _c_del:
+                        if _slot_is_removable(ts):
+                            _slot_key = (
+                                f"plan_del_{selected_date}_{idx}_"
+                                f"{ts.id or ts.task_id or ts.commitment_id}"
+                            )
+                            if _render_delete_control(_slot_key, f"删除：{title}"):
+                                _ok, _label = _delete_slot(agent, ts)
+                                _apply_delete(agent, _ok, _label)
+                                st.rerun()
+                        else:
+                            st.markdown(
+                                "<div style='height:40px'></div>", unsafe_allow_html=True
+                            )
+
+                # 待安排的活跃任务（任务看板中待开始/进行中，但未被调度器安排）
+                unscheduled = _unscheduled_active_tasks(agent, snapshot)
+                if unscheduled:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown("#### 📌 待安排任务")
+                    st.markdown(
+                        "<p style='color:#64748b; font-size:0.8rem; margin-bottom:10px;'>"
+                        "以下任务尚未排入时间计划，请尽快安排或调整截止时间。</p>",
+                        unsafe_allow_html=True,
+                    )
+                    for t in unscheduled:
+                        _render_unscheduled_task_row(agent, t, "plan_after")
+
+                # 牺牲清单
+                if snapshot.sacrifice_list:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown("#### ⚠️ 暂时搁置的任务")
+                    for s in snapshot.sacrifice_list[:5]:
+                        st.markdown(f"""
+                        <div class="sacrifice-card">
+                            <div class="sacrifice-title">{s.task_title}</div>
+                            <div class="sacrifice-reason">{s.reason}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+            else:
+                # 当天无已安排时间槽，但可能有未安排的活跃任务
+                unscheduled = _unscheduled_active_tasks(agent, snapshot)
+                if unscheduled:
+                    st.markdown("#### 📌 待安排任务")
+                    st.markdown(
+                        "<p style='color:#64748b; font-size:0.8rem; margin-bottom:10px;'>"
+                        "以下任务尚未排入时间计划，请尽快安排或调整截止时间。</p>",
+                        unsafe_allow_html=True,
+                    )
+                    for t in unscheduled:
+                        _render_unscheduled_task_row(agent, t, "plan_empty")
+                else:
+                    st.markdown(f"""
+                    <div class="empty-state">
+                        <div class="empty-state-icon">🌴</div>
+                        <div class="empty-state-text">{weekday}没有安排</div>
+                        <div class="empty-state-sub">是休息日吗？好好休息吧！</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+        else:
+            # 没有快照时，仍展示未安排的活跃任务
+            unscheduled = _unscheduled_active_tasks(agent, snapshot)
+            if unscheduled:
+                st.markdown("#### 📌 待安排任务")
+                st.markdown(
+                    "<p style='color:#64748b; font-size:0.8rem; margin-bottom:10px;'>"
+                    "以下任务尚未排入时间计划，请尽快安排或调整截止时间。</p>",
+                    unsafe_allow_html=True,
+                )
+                for t in unscheduled:
+                    _render_unscheduled_task_row(agent, t, "plan_nosnap")
+            else:
+                st.markdown("""
+                <div class="empty-state">
+                    <div class="empty-state-icon">🎯</div>
+                    <div class="empty-state-text">还没有计划</div>
+                    <div class="empty-state-sub">在下方聊天框告诉我你的目标吧</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+
+    # ==========================================
+    # Tab 3: 任务看板
+    # ==========================================
+    with tab_tasks:
+        _render_delete_notice()
+        if agent._tasks:
+            pending_tasks = [t for t in agent._tasks if t.status.value == "pending"]
+            in_progress_tasks = [t for t in agent._tasks if t.status.value == "in_progress"]
+            completed_tasks = [t for t in agent._tasks if t.status.value == "completed"]
+
+            # 按优先级排序
+            pending_tasks.sort(key=lambda x: -x.priority)
+            in_progress_tasks.sort(key=lambda x: -x.priority)
+
+            col1, col2, col3 = st.columns(3, gap="small")
+
+            # 待开始
+            with col1:
+                st.markdown(f"""
+                <div class="kanban-header">
+                    <h3>⏳ 待开始</h3>
+                    <span class="kanban-count">{len(pending_tasks)}</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+                for idx, t in enumerate(pending_tasks[:10]):
+                    hard_badge = '<span class="tag tag-hard">硬截止</span>' if t.deadline_type.value == "hard" else ""
+                    energy_badge = f'<span class="tag tag-{t.energy_level.value}">{energy_icon(t.energy_level.value)}</span>'
+                    pri_text, pri_class = priority_label(t.priority)
+                    pri_badge = f'<span class="tag {pri_class}">{pri_text}</span>'
+
+                    st.markdown(f"""
+                    <div class="task-card" style="animation-delay: {idx * 0.03}s;">
+                        <div class="task-card-header">
+                            <div class="task-card-title">{t.title}</div>
+                            <div class="task-card-badges">
+                                {pri_badge}
+                            </div>
+                        </div>
+                        <div class="task-progress-bar">
+                            <div class="task-progress-fill low" style="width:0%"></div>
+                        </div>
+                        <div class="task-card-footer">
+                            <span>⏱ {t.estimated_minutes} 分钟</span>
+                            <span style="display:flex; gap:4px;">{hard_badge} {energy_badge}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # 卡片操作区：开始 + 删除，紧跟对应卡片（key 用任务 id，不用 idx）
+                    _, _kb_start, _kb_del = st.columns([1.6, 1.0, 1.4])
+                    with _kb_start:
+                        if st.button("▶", key=f"kb_start_{t.id}",
+                                     help=f"开始任务：{t.title}",
+                                     use_container_width=True):
+                            # 只切状态为「进行中」，进度保持 0，等真正汇报时再更新
+                            if agent.start_task(t.id):
+                                st.session_state["action_notice"] = (
+                                    f"已开始「{t.title}」，已移入「进行中」"
+                                )
+                                st.rerun()
+                    with _kb_del:
+                        if _render_delete_control(
+                            f"kb_pending_{t.id}", f"删除任务：{t.title}"
+                        ):
+                            _ok, _label = _delete_task(agent, t)
+                            _apply_delete(agent, _ok, _label)
+                            st.rerun()
+                    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+                if len(pending_tasks) > 10:
+                    st.markdown(f"""
+                    <div style="text-align:center; padding:8px; color:#94a3b8; font-size:0.75rem;">
+                        还有 {len(pending_tasks) - 10} 个...
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # 进行中
+            with col2:
+                st.markdown(f"""
+                <div class="kanban-header">
+                    <h3>🔄 进行中</h3>
+                    <span class="kanban-count">{len(in_progress_tasks)}</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+                for idx, t in enumerate(in_progress_tasks[:10]):
+                    pct = int(t.progress * 100)
+                    progress_class = "mid" if pct < 70 else "high"
+                    hard_badge = '<span class="tag tag-hard">硬截止</span>' if t.deadline_type.value == "hard" else ""
+                    energy_badge = f'<span class="tag tag-{t.energy_level.value}">{energy_icon(t.energy_level.value)}</span>'
+                    pri_text, pri_class = priority_label(t.priority)
+                    pri_badge = f'<span class="tag {pri_class}">{pri_text}</span>'
+
+                    st.markdown(f"""
+                    <div class="task-card" style="animation-delay: {idx * 0.03}s;">
+                        <div class="task-card-header">
+                            <div class="task-card-title">{t.title}</div>
+                            <div class="task-card-badges">
+                                {pri_badge}
+                            </div>
+                        </div>
+                        <div class="task-progress-bar">
+                            <div class="task-progress-fill {progress_class}" style="width:{pct}%"></div>
+                        </div>
+                        <div class="task-card-footer">
+                            <span style="font-weight:600; color:#334155;">{pct}%</span>
+                            <span style="display:flex; gap:4px;">{hard_badge} {energy_badge}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # 操作按钮：退回待开始 + 删除
+                    _, _kb_back, _kb_del = st.columns([2.0, 1.4, 1.4])
+                    with _kb_back:
+                        if st.button("↩ 待开始", key=f"kb_back_doing_{t.id}",
+                                     help="退回待开始状态", use_container_width=True):
+                            agent.reset_task_to_pending(t.id)
+                            st.session_state["action_notice"] = f"已将「{t.title}」退回待开始"
+                            st.rerun()
+                    with _kb_del:
+                        if _render_delete_control(
+                            f"kb_doing_{t.id}", f"删除任务：{t.title}"
+                        ):
+                            _ok, _label = _delete_task(agent, t)
+                            _apply_delete(agent, _ok, _label)
+                            st.rerun()
+                    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+                if len(in_progress_tasks) > 10:
+                    st.markdown(f"""
+                    <div style="text-align:center; padding:8px; color:#94a3b8; font-size:0.75rem;">
+                        还有 {len(in_progress_tasks) - 10} 个...
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # 已完成
+            with col3:
+                st.markdown(f"""
+                <div class="kanban-header">
+                    <h3>✅ 已完成</h3>
+                    <span class="kanban-count">{len(completed_tasks)}</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+                for idx, t in enumerate(completed_tasks[:10]):
+                    st.markdown(f"""
+                    <div class="task-card completed" style="animation-delay: {idx * 0.03}s;">
+                        <div class="task-card-header">
+                            <div class="task-card-title">✅ {t.title}</div>
+                        </div>
+                        <div class="task-progress-bar">
+                            <div class="task-progress-fill high" style="width:100%"></div>
+                        </div>
+                        <div class="task-card-footer">
+                            <span>已完成</span>
+                            <span style="color:#22c55e; font-weight:600;">100%</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # 操作按钮：退回进行中 + 删除
+                    _, _kb_back, _kb_del = st.columns([2.0, 1.4, 1.4])
+                    with _kb_back:
+                        if st.button("↩ 进行中", key=f"kb_back_done_{t.id}",
+                                     help="退回进行中状态", use_container_width=True):
+                            agent.uncomplete_task(t.id)
+                            st.session_state["action_notice"] = f"已将「{t.title}」退回进行中"
+                            st.rerun()
+                    with _kb_del:
+                        if _render_delete_control(
+                            f"kb_done_{t.id}", f"删除任务：{t.title}"
+                        ):
+                            _ok, _label = _delete_task(agent, t)
+                            _apply_delete(agent, _ok, _label)
+                            st.rerun()
+                    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+                if len(completed_tasks) > 10:
+                    st.markdown(f"""
+                    <div style="text-align:center; padding:8px; color:#94a3b8; font-size:0.75rem;">
+                        还有 {len(completed_tasks) - 10} 个...
+                    </div>
+                    """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div class="empty-state">
+                <div class="empty-state-icon">📋</div>
+                <div class="empty-state-text">还没有任务</div>
+                <div class="empty-state-sub">开始设定你的第一个目标吧</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+
+    # ==========================================
+    # Tab 4: 历史快照
+    # ==========================================
+
+    _SNAP_REASON_META = {
+        "initial": ("🎯 初始计划", "#6366f1"),
+        "progress_report": ("📊 进度更新", "#0ea5e9"),
+        "new_goal": ("➕ 新增目标", "#10b981"),
+        "new_event": ("📢 新事件", "#f59e0b"),
+        "cancel_plan": ("✂️ 取消计划", "#f43f5e"),
+        "status_query": ("🔍 状态查询", "#94a3b8"),
+    }
+
+    _SNAP_ACTION_META = {
+        "added": ("➕", "新增", "#10b981"),
+        "moved": ("↔️", "调整时间", "#0ea5e9"),
+        "removed": ("➖", "移除", "#f43f5e"),
+        "shortened": ("⏬", "缩短", "#f59e0b"),
+        "extended": ("⏫", "延长", "#f97316"),
+        "kept": ("•", "保留", "#94a3b8"),
+    }
+
+
+    def _snap_dt(iso: str):
+        """ISO 时间 → datetime；解析失败返回 None。"""
+        try:
+            return datetime.fromisoformat(iso)
+        except (ValueError, TypeError):
+            return None
+
+
+    def _snap_reason_meta(reason: str):
+        """触发原因 → (文案, 主题色)。"""
+        r = reason or "initial"
+        return _SNAP_REASON_META.get(r, (f"🔄 {r}", "#64748b"))
+
+
+    def _snap_items_html(snap) -> str:
+        """结构化变更明细 HTML。"""
+        cl = snap.change_log
+        if not cl or not cl.items:
+            return ""
+        rows = []
+        for it in cl.items:
+            action = it.action.value if hasattr(it.action, "value") else it.action
+            icon, label, color = _SNAP_ACTION_META.get(action, ("•", "变更", "#94a3b8"))
+            t0, t1 = _snap_dt(it.old_time or ""), _snap_dt(it.new_time or "")
+            extra = []
+            if t0 and t1:
+                extra.append(f"{t0:%H:%M} → {t1:%H:%M}")
+            elif t0:
+                extra.append(f"原 {t0:%m-%d %H:%M}")
+            elif t1:
+                extra.append(f"{t1:%m-%d %H:%M} 起")
+            if (it.old_duration is not None and it.new_duration is not None
+                    and it.old_duration != it.new_duration):
+                extra.append(f"时长 {it.old_duration}′ → {it.new_duration}′")
+            elif it.new_duration and action == "added":
+                extra.append(f"{it.new_duration} 分钟")
+            if it.reason:
+                extra.append(it.reason)
+            rows.append(
+                '<div class="snap-diff-row">'
+                f'<span class="snap-chip" style="color:{color};border-color:{color}55;'
+                f'background:{color}14;">{icon} {label}</span>'
+                f'<span class="snap-diff-title">{it.task_title or it.task_id}</span>'
+                f'<span class="snap-diff-extra">{(" · ".join(extra)) if extra else ""}</span>'
+                '</div>'
+            )
+        return "".join(rows)
+
+
+    def _snap_sacrifice_html(snap) -> str:
+        """牺牲清单 HTML（快照级 + 变更日志内嵌，按 task_id 去重）。"""
+        items, seen = [], set()
+        for s in list(snap.sacrifice_list or []):
+            if not s.task_id or s.task_id in seen:
+                continue
+            seen.add(s.task_id)
+            items.append(s)
+        if snap.change_log and snap.change_log.sacrifice_list:
+            for s in snap.change_log.sacrifice_list:
+                if not s.task_id or s.task_id in seen:
+                    continue
+                seen.add(s.task_id)
+                items.append(s)
+        if not items:
+            return ""
+        rows = []
+        for s in items:
+            tag = "延期" if s.action == "delayed" else ("放弃" if s.action == "dropped" else str(s.action))
+            dest = ""
+            if s.delayed_to:
+                dd = _snap_dt(s.delayed_to)
+                dest = f" → {dd:%m-%d}" if dd else f" → {s.delayed_to}"
+            rows.append(
+                '<div class="snap-diff-row">'
+                '<span class="snap-chip" style="color:#f59e0b;border-color:#f59e0b55;'
+                f'background:#f59e0b14;">⏳ {tag}</span>'
+                f'<span class="snap-diff-title">{s.task_title}</span>'
+                f'<span class="snap-diff-extra">{s.reason}{dest}</span>'
+                '</div>'
+            )
+        return "".join(rows)
+
+
+    def _snap_slots_html(snap) -> str:
+        """该次快照的时间安排 HTML。"""
+        slots = snap.time_slots or []
+        if not slots:
+            return ""
+        src_icons = {"task": "📌", "commitment": "🔁", "buffer": "🧩", "rest": "☕"}
+        rows = []
+        for ts in slots:
+            t0, t1 = _snap_dt(ts.start_time), _snap_dt(ts.end_time)
+            if not (t0 and t1):
+                continue
+            src = ts.source.value if hasattr(ts.source, "value") else ts.source
+            icon = src_icons.get(src, "•")
+            name = ts.title or ""
+            rows.append(
+                f'<div class="snap-slot-row">{icon} {t0:%H:%M}–{t1:%H:%M} '
+                f'<span style="font-weight:600;color:#334155;">{name}</span>'
+                f'<span class="snap-slot-min">{ts.duration_minutes} 分钟</span></div>'
+            )
+        return "".join(rows)
+
+
+    with tab_history:
+        snaps_desc = list(reversed(agent._snapshots))
+        if snaps_desc:
+            head_cols = st.columns([4.6, 1.2])
+            with head_cols[0]:
+                st.markdown("#### 📜 计划变更历史")
+                st.markdown(
+                    "<p style='color:#64748b; font-size:0.82rem; margin-bottom:12px;'>"
+                    "每次计划调整都会生成一个快照，可展开查看逐条变更、牺牲项与当时的计划安排。</p>",
+                    unsafe_allow_html=True,
+                )
+            with head_cols[1]:
+                if "clear_snap_confirm" not in st.session_state:
+                    if st.button("🗑 清空全部", key="clear_snap_btn"):
+                        st.session_state["clear_snap_confirm"] = True
+                        st.rerun()
+                else:
+                    st.caption("⚠ 无法恢复")
+                    cy, cn = st.columns(2)
+                    if cy.button("✔", type="primary", use_container_width=True, key="clear_snap_yes"):
+                        n = db.clear_all_snapshots(profile_id=agent.profile.id) if db is not None else 0
+                        agent._snapshots = []
+                        st.session_state.pop("clear_snap_confirm", None)
+                        st.toast(f"已清空 {n} 条历史快照", icon="✅")
+                        st.rerun()
+                    if cn.button("✘", use_container_width=True, key="clear_snap_no"):
+                        st.session_state.pop("clear_snap_confirm", None)
+                        st.rerun()
+
+            # 逐条展示（最新在前）
+            for idx, snap in enumerate(snaps_desc):
+                ver = len(snaps_desc) - idx
+                created_dt = _snap_dt(snap.created_at)
+                created_display = created_dt.strftime("%m-%d %H:%M") if created_dt else snap.created_at
+                reason_label, reason_color = _snap_reason_meta(snap.trigger_reason)
+                n_slots = len(snap.time_slots or [])
+                minutes = snap.total_scheduled_minutes
+                cl = snap.change_log
+                summary = (cl.summary or "") if cl else ""
+                n_items = len(cl.items) if (cl and cl.items) else 0
+
+                badges = ""
+                if snap.hard_deadline_count:
+                    badges += ('<span class="snap-chip" style="color:#ef4444;border-color:#ef444455;'
+                               f'background:#ef444414;">硬截止 {snap.hard_deadline_count}</span>')
+                if snap.risk_count:
+                    badges += ('<span class="snap-chip" style="color:#f59e0b;border-color:#f59e0b55;'
+                               f'background:#f59e0b14;">风险 {snap.risk_count}</span>')
+
+                st.markdown(f"""
+                <div class="snapshot-item">
+                    <div class="snapshot-version" style="background:linear-gradient(135deg, {reason_color}, #94a3b8); box-shadow:0 2px 8px {reason_color}44;">{ver}</div>
+                    <div class="snapshot-info">
+                        <div class="snapshot-reason">{reason_label}
+                            <span style="color:#cbd5e1;font-weight:400;font-size:0.75rem;">· {created_display}</span>
+                        </div>
+                        <div class="snapshot-meta">{n_slots} 个时段 · {minutes} 分钟　{badges}</div>
+                        {('<div class="snap-summary">' + summary + '</div>') if summary else ''}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                slots_html = _snap_slots_html(snap)
+                sac_html = _snap_sacrifice_html(snap)
+                detail_text = cl.detail if (cl and cl.detail) else ""
+
+                if n_items or sac_html or slots_html or detail_text:
+                    with st.expander(f"查看明细 · {n_items} 项变更 / {n_slots} 段安排"):
+                        if n_items:
+                            st.markdown('<div class="snap-section-label">📋 变更明细</div>'
+                                        + _snap_items_html(snap), unsafe_allow_html=True)
+                        if sac_html:
+                            st.markdown('<div class="snap-section-label">⏳ 牺牲清单</div>'
+                                        + sac_html, unsafe_allow_html=True)
+                        if slots_html:
+                            st.markdown('<div class="snap-section-label">🕐 该次计划安排</div>'
+                                        + slots_html, unsafe_allow_html=True)
+                        if detail_text:
+                            st.caption("说明：" + detail_text)
+
+                # 单条删除（二次确认）
+                del_cols = st.columns([5.2, 1.0])
+                with del_cols[0]:
+                    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+                with del_cols[1]:
+                    _dkey = f"snap_del_{snap.id}"
+                    _ckey = f"{_dkey}_confirm"
+                    if st.session_state.get(_ckey):
+                        dy, dn = st.columns(2)
+                        if dy.button("✔", key=f"{_dkey}_yes", help="确认删除该快照",
+                                     use_container_width=True):
+                            if db is not None:
+                                db.delete_snapshot(snap.id)
+                            agent._snapshots = [s for s in agent._snapshots if s.id != snap.id]
+                            st.session_state.pop(_ckey, None)
+                            st.toast(f"已删除快照 v{ver}", icon="🗑")
+                            st.rerun()
+                        if dn.button("✘", key=f"{_dkey}_no", help="取消",
+                                     use_container_width=True):
+                            st.session_state.pop(_ckey, None)
+                            st.rerun()
+                    else:
+                        if st.button("🗑 删除", key=f"{_dkey}_btn",
+                                     help=f"删除快照 v{ver}", use_container_width=True):
+                            st.session_state[_ckey] = True
+                            st.rerun()
+        else:
+            st.markdown("""
+            <div class="empty-state">
+                <div class="empty-state-icon">📜</div>
+                <div class="empty-state-text">还没有历史快照</div>
+                <div class="empty-state-sub">制定计划后，每次调整都会记录在这里</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+
+
+
 def render_placeholder_view(view_key: str) -> None:
     """侧栏导航视图：courses 渲染真实课表，其余为占位界面。"""
     icon, label, sub = NAV_VIEWS.get(view_key, ("✨", "LifeOS", ""))
@@ -1362,6 +2236,11 @@ def render_placeholder_view(view_key: str) -> None:
     # 笔记视图：渲染真实的笔记管理界面
     if view_key == "notes":
         render_notes_view()
+        return
+
+    # 日程视图：概览/今日计划/任务看板/历史快照
+    if view_key == "schedule":
+        render_schedule_view()
         return
 
     st.markdown(f"""
@@ -2402,830 +3281,6 @@ with col4:
         """, unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
-
-
-# ==========================================
-# Tab 切换
-# ==========================================
-tab_dashboard, tab_plan, tab_tasks, tab_history = st.tabs([
-    "  📊  概览  ",
-    "  📅  今日计划  ",
-    "  📋  任务看板  ",
-    "  📜  历史快照  ",
-])
-
-
-# ==========================================
-# Tab 1: 概览仪表盘
-# ==========================================
-with tab_dashboard:
-    left_col, right_col = st.columns([2, 1])
-
-    with left_col:
-        st.markdown("#### 📅 今日安排")
-
-        today = date.today()
-        if snapshot and snapshot.time_slots:
-            today_slots = [
-                ts for ts in snapshot.time_slots
-                if ts.start_time.startswith(str(today))
-            ]
-
-            if today_slots:
-                st.markdown('<div class="timeline-container">', unsafe_allow_html=True)
-                for idx, ts in enumerate(today_slots[:8]):
-                    start = ts.start_time.split("T")[1][:5]
-                    end = ts.end_time.split("T")[1][:5]
-                    duration = int((datetime.fromisoformat(ts.end_time)
-                                  - datetime.fromisoformat(ts.start_time)).total_seconds() / 60)
-
-                    src = ts.source.value if hasattr(ts.source, 'value') else ts.source
-                    task = agent.get_task(ts.task_id) if ts.task_id else None
-                    title = task.title if task else ts.title or "安排"
-                    energy = task.energy_level.value if task and task.energy_level else "medium"
-                    # 完成状态：与「今日计划」共用同一 session_state key
-                    done_key = f"plan_done_{ts.id or ts.task_id or idx}"
-                    show_done = bool(
-                        (task and task.status.value == "completed")
-                        or st.session_state.get(done_key)
-                    )
-
-                    # 圆点颜色（已完成统一绿色）
-                    if show_done:
-                        dot_color = "#16a34a"
-                        card_class = "task"
-                    elif src == "commitment":
-                        dot_color = "#f59e0b"
-                        card_class = "commitment"
-                    elif src == "buffer":
-                        dot_color = "#94a3b8"
-                        card_class = "buffer"
-                    else:
-                        dot_color = "#6366f1"
-                        card_class = "task"
-
-                    if show_done:
-                        st.markdown(
-                            '<div class="timeline-item" style="animation-delay:'
-                            f' {idx * 0.05}s;">'
-                            f'<div class="timeline-time">{start}</div>'
-                            '<div class="timeline-dot" style="background:#16a34a;"></div>'
-                            '<div class="timeline-card" style="background:#f0fdf4;border-left:3px solid rgba(22,163,74,0.45);">'
-                            f'<div class="timeline-title" style="text-decoration:line-through;color:#86efac;">{title}</div>'
-                            '<div class="timeline-meta">⏱ '
-                            f'{duration} 分钟 · <span style="color:#16a34a;font-weight:600">✓ 已完成</span>'
-                            '</div></div></div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        st.markdown(
-                            '<div class="timeline-item" style="animation-delay:'
-                            f' {idx * 0.05}s;">'
-                            f'<div class="timeline-time">{start}</div>'
-                            f'<div class="timeline-dot" style="background:{dot_color};"></div>'
-                            f'<div class="timeline-card {card_class}">'
-                            f'<div class="timeline-title">{title}</div>'
-                            f'<div class="timeline-meta">⏱ {duration} 分钟'
-                            f'{" · 🔴硬截止" if task and task.deadline_type.value == "hard" else ""}'
-                            f'{" · " + energy_icon(energy) if task else ""}'
-                            '</div></div></div>',
-                            unsafe_allow_html=True,
-                        )
-
-                if len(today_slots) > 8:
-                    st.markdown(f"""
-                    <div style="text-align:center; padding:10px 0 4px; color:#94a3b8; font-size:0.78rem;
-                                cursor:pointer; transition: color 0.2s;" onmouseover="this.style.color='#64748b'">
-                        还有 {len(today_slots) - 8} 个安排 → 切换到「今日计划」查看全部
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                st.markdown('</div>', unsafe_allow_html=True)
-
-                # 今日截止但未安排的活跃任务（日期对得上则补显到概览）
-                _unsched_today = [
-                    t for t in _unscheduled_active_tasks(agent, snapshot)
-                    if _task_deadline_date(t) == today
-                ]
-                if _unsched_today:
-                    st.markdown(
-                        "<div style='margin-top:10px; font-size:0.8rem; color:#d97706; font-weight:600;'>"
-                        "📌 今日截止 · 待安排</div>",
-                        unsafe_allow_html=True,
-                    )
-                    for t in _unsched_today:
-                        _render_unscheduled_task_row(agent, t, "dash_today", compact=True)
-            else:
-                # 今天没有已安排时间槽，检查是否有今日截止的未安排任务
-                _unsched_today = [
-                    t for t in _unscheduled_active_tasks(agent, snapshot)
-                    if _task_deadline_date(t) == today
-                ]
-                if _unsched_today:
-                    st.markdown(
-                        "<div style='font-size:0.8rem; color:#d97706; font-weight:600; margin-bottom:8px;'>"
-                        "📌 今日截止 · 待安排</div>",
-                        unsafe_allow_html=True,
-                    )
-                    for t in _unsched_today:
-                        _render_unscheduled_task_row(agent, t, "dash_empty", compact=True)
-                else:
-                    st.markdown("""
-                    <div class="empty-state">
-                        <div class="empty-state-icon">🌅</div>
-                        <div class="empty-state-text">今天还没有安排</div>
-                        <div class="empty-state-sub">在下方聊天框设定你的第一个目标吧</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-        else:
-            # 没有快照时，检查是否有今日截止的未安排任务
-            _unsched_today = [
-                t for t in _unscheduled_active_tasks(agent, snapshot)
-                if _task_deadline_date(t) == today
-            ]
-            if _unsched_today:
-                st.markdown(
-                    "<div style='font-size:0.8rem; color:#d97706; font-weight:600; margin-bottom:8px;'>"
-                    "📌 今日截止 · 待安排</div>",
-                    unsafe_allow_html=True,
-                )
-                for t in _unsched_today:
-                    _render_unscheduled_task_row(agent, t, "dash_nosnap", compact=True)
-            else:
-                st.markdown("""
-                <div class="empty-state">
-                    <div class="empty-state-icon">🎯</div>
-                    <div class="empty-state-text">还没有计划</div>
-                    <div class="empty-state-sub">告诉我你的目标，我来帮你安排</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-    with right_col:
-        # 风险提示（完成进度与任务分布已移至侧栏）
-        if sacrifice_count > 0:
-            st.markdown("#### ⚠️ 需要关注")
-            for s in (snapshot.sacrifice_list if snapshot else [])[:3]:
-                st.markdown(f"""
-                <div class="sacrifice-card">
-                    <div class="sacrifice-title">{s.task_title}</div>
-                    <div class="sacrifice-reason">{s.reason}</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-
-# ==========================================
-# Tab 2: 今日计划（时间轴）
-# ==========================================
-with tab_plan:
-    _render_delete_notice()
-    col_date, _ = st.columns([1, 3])
-    with col_date:
-        selected_date = st.date_input(
-            "选择日期",
-            value=st.session_state.current_date,
-            label_visibility="collapsed",
-            key="plan_date_tab",
-        )
-    st.session_state.current_date = selected_date
-
-    date_title = selected_date.strftime("%Y年%m月%d日")
-    weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    weekday = weekday_names[selected_date.weekday()]
-
-    st.markdown(f"""
-    <div class="date-header">
-        <div>
-            <div class="date-title">{date_title} · {weekday}</div>
-            <div class="date-subtitle">今日学习计划</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    if snapshot and snapshot.time_slots:
-        day_slots = [
-            ts for ts in snapshot.time_slots
-            if ts.start_time.startswith(str(selected_date))
-        ]
-
-        if day_slots:
-            # 统计
-            task_minutes = sum(
-                int((datetime.fromisoformat(ts.end_time) - datetime.fromisoformat(ts.start_time)).total_seconds() / 60)
-                for ts in day_slots
-                if (ts.source.value if hasattr(ts.source, 'value') else ts.source) == "task"
-            )
-            commitment_count = sum(
-                1 for ts in day_slots
-                if (ts.source.value if hasattr(ts.source, 'value') else ts.source) == "commitment"
-            )
-            st.markdown(f"""
-            <div style="display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap;">
-                <div style="background:linear-gradient(135deg, #eff6ff, #dbeafe); padding:7px 14px; border-radius:20px; font-size:0.78rem; color:#1d4ed8; font-weight:500;">
-                    📚 学习 {task_minutes} 分钟
-                </div>
-                <div style="background:linear-gradient(135deg, #f0fdf4, #dcfce7); padding:7px 14px; border-radius:20px; font-size:0.78rem; color:#16a34a; font-weight:500;">
-                    📝 共 {len(day_slots)} 个安排
-                </div>
-                {f'<div style="background:linear-gradient(135deg, #fffbeb, #fef3c7); padding:7px 14px; border-radius:20px; font-size:0.78rem; color:#d97706; font-weight:500;">📌 {commitment_count} 个承诺</div>' if commitment_count > 0 else ''}
-            </div>
-            """, unsafe_allow_html=True)
-
-            # 时间轴（纯 Streamlit 原生行布局，不混用 HTML columns）
-            for idx, ts in enumerate(day_slots):
-                start = ts.start_time.split("T")[1][:5]
-                end = ts.end_time.split("T")[1][:5]
-                duration = int((datetime.fromisoformat(ts.end_time)
-                              - datetime.fromisoformat(ts.start_time)).total_seconds() / 60)
-
-                src = ts.source.value if hasattr(ts.source, 'value') else ts.source
-                task = agent.get_task(ts.task_id) if ts.task_id else None
-                title = task.title if task else ts.title or "安排"
-                energy = task.energy_level.value if task and task.energy_level else "medium"
-                # 完成状态：task.status 优先，session_state 兜底
-                is_done = bool(task and task.status.value == "completed")
-                done_key = f"plan_done_{ts.id or ts.task_id or idx}"
-                is_done_local = done_key in st.session_state and st.session_state[done_key]
-                show_done = is_done or is_done_local
-
-                if src == "commitment":
-                    dot_color = "#f59e0b"
-                    card_border = "rgba(245,158,11,0.35)"
-                elif src == "buffer":
-                    dot_color = "#94a3b8"
-                    card_border = "rgba(148,163,184,0.35)"
-                    title = "☕ 休息缓冲"
-                else:
-                    dot_color = "#6366f1"
-                    card_border = "rgba(99,102,241,0.35)"
-
-                # 标签
-                tag_strs = []
-                if task and task.deadline_type.value == "hard":
-                    tag_strs.append("🔴 硬截止")
-                if task:
-                    tag_strs.append(f"{energy_icon(energy)} {energy}")
-                tag_line = " · ".join(tag_strs)
-
-                # 行布局：时间 | 圆点+卡片 | 完成 | 删除
-                _c_time, _c_dot, _c_card, _c_done, _c_del = st.columns(
-                    [1.2, 0.15, 5.5, 1.3, 1.1]
-                )
-                with _c_time:
-                    st.markdown(f"<div style='color:#64748b;font-size:0.78rem;text-align:center;padding-top:6px;white-space:nowrap'>{start}<br>—<br>{end}</div>", unsafe_allow_html=True)
-                with _c_dot:
-                    st.markdown(f"<div style='width:10px;height:10px;border-radius:50%;background:{dot_color};margin-top:14px;margin-left:4px;'></div>", unsafe_allow_html=True)
-                with _c_card:
-                    if show_done:
-                        st.markdown(f"""
-                        <div style="border-left:3px solid rgba(22,163,74,0.45);padding:6px 12px;margin-bottom:4px;border-radius:0 8px 8px 0;background:#f0fdf4;">
-                            <div style="font-weight:600;text-decoration:line-through;color:#86efac;font-size:0.9rem;">{title}</div>
-                            <div style="font-size:0.72rem;color:#64748b;margin-top:2px;">⏱ {duration} 分钟{f' · {tag_line}' if tag_line else ''}</div>
-                            <div style="color:#16a34a;font-size:0.72rem;font-weight:600;margin-top:2px;">✓ 已完成（再点一次可取消）</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"""
-                        <div style="border-left:3px solid {card_border};padding:6px 12px;margin-bottom:4px;border-radius:0 8px 8px 0;background:{'#eef2ff' if src=='task' else '#fff7ed' if src=='commitment' else '#f8fafc'};">
-                            <div style="font-weight:600;font-size:0.9rem;">{title}</div>
-                            <div style="font-size:0.72rem;color:#64748b;margin-top:2px;">⏱ {duration} 分钟{f' · {tag_line}' if tag_line else ''}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                with _c_done:
-                    if src == "task":
-                        if show_done:
-                            if st.button("✓", key=f"{done_key}_btn", help="点击取消完成",
-                                         use_container_width=True):
-                                st.session_state[done_key] = False
-                                if task is not None:
-                                    agent.uncomplete_task(task.id)
-                                st.rerun()
-                        else:
-                            if st.button("☐", key=f"{done_key}_btn",
-                                         help="标记完成", use_container_width=True):
-                                st.session_state[done_key] = True
-                                if task is not None:
-                                    agent.complete_task(task.id)
-                                st.rerun()
-                    else:
-                        st.markdown("<div style='height:40px'></div>", unsafe_allow_html=True)
-
-                with _c_del:
-                    if _slot_is_removable(ts):
-                        _slot_key = (
-                            f"plan_del_{selected_date}_{idx}_"
-                            f"{ts.id or ts.task_id or ts.commitment_id}"
-                        )
-                        if _render_delete_control(_slot_key, f"删除：{title}"):
-                            _ok, _label = _delete_slot(agent, ts)
-                            _apply_delete(agent, _ok, _label)
-                            st.rerun()
-                    else:
-                        st.markdown(
-                            "<div style='height:40px'></div>", unsafe_allow_html=True
-                        )
-
-            # 待安排的活跃任务（任务看板中待开始/进行中，但未被调度器安排）
-            unscheduled = _unscheduled_active_tasks(agent, snapshot)
-            if unscheduled:
-                st.markdown("<br>", unsafe_allow_html=True)
-                st.markdown("#### 📌 待安排任务")
-                st.markdown(
-                    "<p style='color:#64748b; font-size:0.8rem; margin-bottom:10px;'>"
-                    "以下任务尚未排入时间计划，请尽快安排或调整截止时间。</p>",
-                    unsafe_allow_html=True,
-                )
-                for t in unscheduled:
-                    _render_unscheduled_task_row(agent, t, "plan_after")
-
-            # 牺牲清单
-            if snapshot.sacrifice_list:
-                st.markdown("<br>", unsafe_allow_html=True)
-                st.markdown("#### ⚠️ 暂时搁置的任务")
-                for s in snapshot.sacrifice_list[:5]:
-                    st.markdown(f"""
-                    <div class="sacrifice-card">
-                        <div class="sacrifice-title">{s.task_title}</div>
-                        <div class="sacrifice-reason">{s.reason}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-        else:
-            # 当天无已安排时间槽，但可能有未安排的活跃任务
-            unscheduled = _unscheduled_active_tasks(agent, snapshot)
-            if unscheduled:
-                st.markdown("#### 📌 待安排任务")
-                st.markdown(
-                    "<p style='color:#64748b; font-size:0.8rem; margin-bottom:10px;'>"
-                    "以下任务尚未排入时间计划，请尽快安排或调整截止时间。</p>",
-                    unsafe_allow_html=True,
-                )
-                for t in unscheduled:
-                    _render_unscheduled_task_row(agent, t, "plan_empty")
-            else:
-                st.markdown(f"""
-                <div class="empty-state">
-                    <div class="empty-state-icon">🌴</div>
-                    <div class="empty-state-text">{weekday}没有安排</div>
-                    <div class="empty-state-sub">是休息日吗？好好休息吧！</div>
-                </div>
-                """, unsafe_allow_html=True)
-    else:
-        # 没有快照时，仍展示未安排的活跃任务
-        unscheduled = _unscheduled_active_tasks(agent, snapshot)
-        if unscheduled:
-            st.markdown("#### 📌 待安排任务")
-            st.markdown(
-                "<p style='color:#64748b; font-size:0.8rem; margin-bottom:10px;'>"
-                "以下任务尚未排入时间计划，请尽快安排或调整截止时间。</p>",
-                unsafe_allow_html=True,
-            )
-            for t in unscheduled:
-                _render_unscheduled_task_row(agent, t, "plan_nosnap")
-        else:
-            st.markdown("""
-            <div class="empty-state">
-                <div class="empty-state-icon">🎯</div>
-                <div class="empty-state-text">还没有计划</div>
-                <div class="empty-state-sub">在下方聊天框告诉我你的目标吧</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-
-# ==========================================
-# Tab 3: 任务看板
-# ==========================================
-with tab_tasks:
-    _render_delete_notice()
-    if agent._tasks:
-        pending_tasks = [t for t in agent._tasks if t.status.value == "pending"]
-        in_progress_tasks = [t for t in agent._tasks if t.status.value == "in_progress"]
-        completed_tasks = [t for t in agent._tasks if t.status.value == "completed"]
-
-        # 按优先级排序
-        pending_tasks.sort(key=lambda x: -x.priority)
-        in_progress_tasks.sort(key=lambda x: -x.priority)
-
-        col1, col2, col3 = st.columns(3, gap="small")
-
-        # 待开始
-        with col1:
-            st.markdown(f"""
-            <div class="kanban-header">
-                <h3>⏳ 待开始</h3>
-                <span class="kanban-count">{len(pending_tasks)}</span>
-            </div>
-            """, unsafe_allow_html=True)
-
-            for idx, t in enumerate(pending_tasks[:10]):
-                hard_badge = '<span class="tag tag-hard">硬截止</span>' if t.deadline_type.value == "hard" else ""
-                energy_badge = f'<span class="tag tag-{t.energy_level.value}">{energy_icon(t.energy_level.value)}</span>'
-                pri_text, pri_class = priority_label(t.priority)
-                pri_badge = f'<span class="tag {pri_class}">{pri_text}</span>'
-
-                st.markdown(f"""
-                <div class="task-card" style="animation-delay: {idx * 0.03}s;">
-                    <div class="task-card-header">
-                        <div class="task-card-title">{t.title}</div>
-                        <div class="task-card-badges">
-                            {pri_badge}
-                        </div>
-                    </div>
-                    <div class="task-progress-bar">
-                        <div class="task-progress-fill low" style="width:0%"></div>
-                    </div>
-                    <div class="task-card-footer">
-                        <span>⏱ {t.estimated_minutes} 分钟</span>
-                        <span style="display:flex; gap:4px;">{hard_badge} {energy_badge}</span>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # 卡片操作区：开始 + 删除，紧跟对应卡片（key 用任务 id，不用 idx）
-                _, _kb_start, _kb_del = st.columns([1.6, 1.0, 1.4])
-                with _kb_start:
-                    if st.button("▶", key=f"kb_start_{t.id}",
-                                 help=f"开始任务：{t.title}",
-                                 use_container_width=True):
-                        # 只切状态为「进行中」，进度保持 0，等真正汇报时再更新
-                        if agent.start_task(t.id):
-                            st.session_state["action_notice"] = (
-                                f"已开始「{t.title}」，已移入「进行中」"
-                            )
-                            st.rerun()
-                with _kb_del:
-                    if _render_delete_control(
-                        f"kb_pending_{t.id}", f"删除任务：{t.title}"
-                    ):
-                        _ok, _label = _delete_task(agent, t)
-                        _apply_delete(agent, _ok, _label)
-                        st.rerun()
-                st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-            if len(pending_tasks) > 10:
-                st.markdown(f"""
-                <div style="text-align:center; padding:8px; color:#94a3b8; font-size:0.75rem;">
-                    还有 {len(pending_tasks) - 10} 个...
-                </div>
-                """, unsafe_allow_html=True)
-
-        # 进行中
-        with col2:
-            st.markdown(f"""
-            <div class="kanban-header">
-                <h3>🔄 进行中</h3>
-                <span class="kanban-count">{len(in_progress_tasks)}</span>
-            </div>
-            """, unsafe_allow_html=True)
-
-            for idx, t in enumerate(in_progress_tasks[:10]):
-                pct = int(t.progress * 100)
-                progress_class = "mid" if pct < 70 else "high"
-                hard_badge = '<span class="tag tag-hard">硬截止</span>' if t.deadline_type.value == "hard" else ""
-                energy_badge = f'<span class="tag tag-{t.energy_level.value}">{energy_icon(t.energy_level.value)}</span>'
-                pri_text, pri_class = priority_label(t.priority)
-                pri_badge = f'<span class="tag {pri_class}">{pri_text}</span>'
-
-                st.markdown(f"""
-                <div class="task-card" style="animation-delay: {idx * 0.03}s;">
-                    <div class="task-card-header">
-                        <div class="task-card-title">{t.title}</div>
-                        <div class="task-card-badges">
-                            {pri_badge}
-                        </div>
-                    </div>
-                    <div class="task-progress-bar">
-                        <div class="task-progress-fill {progress_class}" style="width:{pct}%"></div>
-                    </div>
-                    <div class="task-card-footer">
-                        <span style="font-weight:600; color:#334155;">{pct}%</span>
-                        <span style="display:flex; gap:4px;">{hard_badge} {energy_badge}</span>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # 操作按钮：退回待开始 + 删除
-                _, _kb_back, _kb_del = st.columns([2.0, 1.4, 1.4])
-                with _kb_back:
-                    if st.button("↩ 待开始", key=f"kb_back_doing_{t.id}",
-                                 help="退回待开始状态", use_container_width=True):
-                        agent.reset_task_to_pending(t.id)
-                        st.session_state["action_notice"] = f"已将「{t.title}」退回待开始"
-                        st.rerun()
-                with _kb_del:
-                    if _render_delete_control(
-                        f"kb_doing_{t.id}", f"删除任务：{t.title}"
-                    ):
-                        _ok, _label = _delete_task(agent, t)
-                        _apply_delete(agent, _ok, _label)
-                        st.rerun()
-                st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-            if len(in_progress_tasks) > 10:
-                st.markdown(f"""
-                <div style="text-align:center; padding:8px; color:#94a3b8; font-size:0.75rem;">
-                    还有 {len(in_progress_tasks) - 10} 个...
-                </div>
-                """, unsafe_allow_html=True)
-
-        # 已完成
-        with col3:
-            st.markdown(f"""
-            <div class="kanban-header">
-                <h3>✅ 已完成</h3>
-                <span class="kanban-count">{len(completed_tasks)}</span>
-            </div>
-            """, unsafe_allow_html=True)
-
-            for idx, t in enumerate(completed_tasks[:10]):
-                st.markdown(f"""
-                <div class="task-card completed" style="animation-delay: {idx * 0.03}s;">
-                    <div class="task-card-header">
-                        <div class="task-card-title">✅ {t.title}</div>
-                    </div>
-                    <div class="task-progress-bar">
-                        <div class="task-progress-fill high" style="width:100%"></div>
-                    </div>
-                    <div class="task-card-footer">
-                        <span>已完成</span>
-                        <span style="color:#22c55e; font-weight:600;">100%</span>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # 操作按钮：退回进行中 + 删除
-                _, _kb_back, _kb_del = st.columns([2.0, 1.4, 1.4])
-                with _kb_back:
-                    if st.button("↩ 进行中", key=f"kb_back_done_{t.id}",
-                                 help="退回进行中状态", use_container_width=True):
-                        agent.uncomplete_task(t.id)
-                        st.session_state["action_notice"] = f"已将「{t.title}」退回进行中"
-                        st.rerun()
-                with _kb_del:
-                    if _render_delete_control(
-                        f"kb_done_{t.id}", f"删除任务：{t.title}"
-                    ):
-                        _ok, _label = _delete_task(agent, t)
-                        _apply_delete(agent, _ok, _label)
-                        st.rerun()
-                st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-            if len(completed_tasks) > 10:
-                st.markdown(f"""
-                <div style="text-align:center; padding:8px; color:#94a3b8; font-size:0.75rem;">
-                    还有 {len(completed_tasks) - 10} 个...
-                </div>
-                """, unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="empty-state">
-            <div class="empty-state-icon">📋</div>
-            <div class="empty-state-text">还没有任务</div>
-            <div class="empty-state-sub">开始设定你的第一个目标吧</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-
-# ==========================================
-# Tab 4: 历史快照
-# ==========================================
-
-_SNAP_REASON_META = {
-    "initial": ("🎯 初始计划", "#6366f1"),
-    "progress_report": ("📊 进度更新", "#0ea5e9"),
-    "new_goal": ("➕ 新增目标", "#10b981"),
-    "new_event": ("📢 新事件", "#f59e0b"),
-    "cancel_plan": ("✂️ 取消计划", "#f43f5e"),
-    "status_query": ("🔍 状态查询", "#94a3b8"),
-}
-
-_SNAP_ACTION_META = {
-    "added": ("➕", "新增", "#10b981"),
-    "moved": ("↔️", "调整时间", "#0ea5e9"),
-    "removed": ("➖", "移除", "#f43f5e"),
-    "shortened": ("⏬", "缩短", "#f59e0b"),
-    "extended": ("⏫", "延长", "#f97316"),
-    "kept": ("•", "保留", "#94a3b8"),
-}
-
-
-def _snap_dt(iso: str):
-    """ISO 时间 → datetime；解析失败返回 None。"""
-    try:
-        return datetime.fromisoformat(iso)
-    except (ValueError, TypeError):
-        return None
-
-
-def _snap_reason_meta(reason: str):
-    """触发原因 → (文案, 主题色)。"""
-    r = reason or "initial"
-    return _SNAP_REASON_META.get(r, (f"🔄 {r}", "#64748b"))
-
-
-def _snap_items_html(snap) -> str:
-    """结构化变更明细 HTML。"""
-    cl = snap.change_log
-    if not cl or not cl.items:
-        return ""
-    rows = []
-    for it in cl.items:
-        action = it.action.value if hasattr(it.action, "value") else it.action
-        icon, label, color = _SNAP_ACTION_META.get(action, ("•", "变更", "#94a3b8"))
-        t0, t1 = _snap_dt(it.old_time or ""), _snap_dt(it.new_time or "")
-        extra = []
-        if t0 and t1:
-            extra.append(f"{t0:%H:%M} → {t1:%H:%M}")
-        elif t0:
-            extra.append(f"原 {t0:%m-%d %H:%M}")
-        elif t1:
-            extra.append(f"{t1:%m-%d %H:%M} 起")
-        if (it.old_duration is not None and it.new_duration is not None
-                and it.old_duration != it.new_duration):
-            extra.append(f"时长 {it.old_duration}′ → {it.new_duration}′")
-        elif it.new_duration and action == "added":
-            extra.append(f"{it.new_duration} 分钟")
-        if it.reason:
-            extra.append(it.reason)
-        rows.append(
-            '<div class="snap-diff-row">'
-            f'<span class="snap-chip" style="color:{color};border-color:{color}55;'
-            f'background:{color}14;">{icon} {label}</span>'
-            f'<span class="snap-diff-title">{it.task_title or it.task_id}</span>'
-            f'<span class="snap-diff-extra">{(" · ".join(extra)) if extra else ""}</span>'
-            '</div>'
-        )
-    return "".join(rows)
-
-
-def _snap_sacrifice_html(snap) -> str:
-    """牺牲清单 HTML（快照级 + 变更日志内嵌，按 task_id 去重）。"""
-    items, seen = [], set()
-    for s in list(snap.sacrifice_list or []):
-        if not s.task_id or s.task_id in seen:
-            continue
-        seen.add(s.task_id)
-        items.append(s)
-    if snap.change_log and snap.change_log.sacrifice_list:
-        for s in snap.change_log.sacrifice_list:
-            if not s.task_id or s.task_id in seen:
-                continue
-            seen.add(s.task_id)
-            items.append(s)
-    if not items:
-        return ""
-    rows = []
-    for s in items:
-        tag = "延期" if s.action == "delayed" else ("放弃" if s.action == "dropped" else str(s.action))
-        dest = ""
-        if s.delayed_to:
-            dd = _snap_dt(s.delayed_to)
-            dest = f" → {dd:%m-%d}" if dd else f" → {s.delayed_to}"
-        rows.append(
-            '<div class="snap-diff-row">'
-            '<span class="snap-chip" style="color:#f59e0b;border-color:#f59e0b55;'
-            f'background:#f59e0b14;">⏳ {tag}</span>'
-            f'<span class="snap-diff-title">{s.task_title}</span>'
-            f'<span class="snap-diff-extra">{s.reason}{dest}</span>'
-            '</div>'
-        )
-    return "".join(rows)
-
-
-def _snap_slots_html(snap) -> str:
-    """该次快照的时间安排 HTML。"""
-    slots = snap.time_slots or []
-    if not slots:
-        return ""
-    src_icons = {"task": "📌", "commitment": "🔁", "buffer": "🧩", "rest": "☕"}
-    rows = []
-    for ts in slots:
-        t0, t1 = _snap_dt(ts.start_time), _snap_dt(ts.end_time)
-        if not (t0 and t1):
-            continue
-        src = ts.source.value if hasattr(ts.source, "value") else ts.source
-        icon = src_icons.get(src, "•")
-        name = ts.title or ""
-        rows.append(
-            f'<div class="snap-slot-row">{icon} {t0:%H:%M}–{t1:%H:%M} '
-            f'<span style="font-weight:600;color:#334155;">{name}</span>'
-            f'<span class="snap-slot-min">{ts.duration_minutes} 分钟</span></div>'
-        )
-    return "".join(rows)
-
-
-with tab_history:
-    snaps_desc = list(reversed(agent._snapshots))
-    if snaps_desc:
-        head_cols = st.columns([4.6, 1.2])
-        with head_cols[0]:
-            st.markdown("#### 📜 计划变更历史")
-            st.markdown(
-                "<p style='color:#64748b; font-size:0.82rem; margin-bottom:12px;'>"
-                "每次计划调整都会生成一个快照，可展开查看逐条变更、牺牲项与当时的计划安排。</p>",
-                unsafe_allow_html=True,
-            )
-        with head_cols[1]:
-            if "clear_snap_confirm" not in st.session_state:
-                if st.button("🗑 清空全部", key="clear_snap_btn"):
-                    st.session_state["clear_snap_confirm"] = True
-                    st.rerun()
-            else:
-                st.caption("⚠ 无法恢复")
-                cy, cn = st.columns(2)
-                if cy.button("✔", type="primary", use_container_width=True, key="clear_snap_yes"):
-                    n = db.clear_all_snapshots(profile_id=agent.profile.id) if db is not None else 0
-                    agent._snapshots = []
-                    st.session_state.pop("clear_snap_confirm", None)
-                    st.toast(f"已清空 {n} 条历史快照", icon="✅")
-                    st.rerun()
-                if cn.button("✘", use_container_width=True, key="clear_snap_no"):
-                    st.session_state.pop("clear_snap_confirm", None)
-                    st.rerun()
-
-        # 逐条展示（最新在前）
-        for idx, snap in enumerate(snaps_desc):
-            ver = len(snaps_desc) - idx
-            created_dt = _snap_dt(snap.created_at)
-            created_display = created_dt.strftime("%m-%d %H:%M") if created_dt else snap.created_at
-            reason_label, reason_color = _snap_reason_meta(snap.trigger_reason)
-            n_slots = len(snap.time_slots or [])
-            minutes = snap.total_scheduled_minutes
-            cl = snap.change_log
-            summary = (cl.summary or "") if cl else ""
-            n_items = len(cl.items) if (cl and cl.items) else 0
-
-            badges = ""
-            if snap.hard_deadline_count:
-                badges += ('<span class="snap-chip" style="color:#ef4444;border-color:#ef444455;'
-                           f'background:#ef444414;">硬截止 {snap.hard_deadline_count}</span>')
-            if snap.risk_count:
-                badges += ('<span class="snap-chip" style="color:#f59e0b;border-color:#f59e0b55;'
-                           f'background:#f59e0b14;">风险 {snap.risk_count}</span>')
-
-            st.markdown(f"""
-            <div class="snapshot-item">
-                <div class="snapshot-version" style="background:linear-gradient(135deg, {reason_color}, #94a3b8); box-shadow:0 2px 8px {reason_color}44;">{ver}</div>
-                <div class="snapshot-info">
-                    <div class="snapshot-reason">{reason_label}
-                        <span style="color:#cbd5e1;font-weight:400;font-size:0.75rem;">· {created_display}</span>
-                    </div>
-                    <div class="snapshot-meta">{n_slots} 个时段 · {minutes} 分钟　{badges}</div>
-                    {('<div class="snap-summary">' + summary + '</div>') if summary else ''}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            slots_html = _snap_slots_html(snap)
-            sac_html = _snap_sacrifice_html(snap)
-            detail_text = cl.detail if (cl and cl.detail) else ""
-
-            if n_items or sac_html or slots_html or detail_text:
-                with st.expander(f"查看明细 · {n_items} 项变更 / {n_slots} 段安排"):
-                    if n_items:
-                        st.markdown('<div class="snap-section-label">📋 变更明细</div>'
-                                    + _snap_items_html(snap), unsafe_allow_html=True)
-                    if sac_html:
-                        st.markdown('<div class="snap-section-label">⏳ 牺牲清单</div>'
-                                    + sac_html, unsafe_allow_html=True)
-                    if slots_html:
-                        st.markdown('<div class="snap-section-label">🕐 该次计划安排</div>'
-                                    + slots_html, unsafe_allow_html=True)
-                    if detail_text:
-                        st.caption("说明：" + detail_text)
-
-            # 单条删除（二次确认）
-            del_cols = st.columns([5.2, 1.0])
-            with del_cols[0]:
-                st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-            with del_cols[1]:
-                _dkey = f"snap_del_{snap.id}"
-                _ckey = f"{_dkey}_confirm"
-                if st.session_state.get(_ckey):
-                    dy, dn = st.columns(2)
-                    if dy.button("✔", key=f"{_dkey}_yes", help="确认删除该快照",
-                                 use_container_width=True):
-                        if db is not None:
-                            db.delete_snapshot(snap.id)
-                        agent._snapshots = [s for s in agent._snapshots if s.id != snap.id]
-                        st.session_state.pop(_ckey, None)
-                        st.toast(f"已删除快照 v{ver}", icon="🗑")
-                        st.rerun()
-                    if dn.button("✘", key=f"{_dkey}_no", help="取消",
-                                 use_container_width=True):
-                        st.session_state.pop(_ckey, None)
-                        st.rerun()
-                else:
-                    if st.button("🗑 删除", key=f"{_dkey}_btn",
-                                 help=f"删除快照 v{ver}", use_container_width=True):
-                        st.session_state[_ckey] = True
-                        st.rerun()
-    else:
-        st.markdown("""
-        <div class="empty-state">
-            <div class="empty-state-icon">📜</div>
-            <div class="empty-state-text">还没有历史快照</div>
-            <div class="empty-state-sub">制定计划后，每次调整都会记录在这里</div>
-        </div>
-        """, unsafe_allow_html=True)
 
 
 # ==========================================
