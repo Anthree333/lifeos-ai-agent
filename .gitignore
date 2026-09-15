@@ -18,3 +18,7 @@ demo/screenshots/
 # IDE
 .idea/
 .vscode/
+.trae/
+
+# 运行时 home（Streamlit machine id 等）
+.streamlit_home/

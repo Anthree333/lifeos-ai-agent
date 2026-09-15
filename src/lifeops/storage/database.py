@@ -216,6 +216,12 @@ CREATE TABLE IF NOT EXISTS notes (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_tasks_goal_id ON tasks(goal_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -253,7 +259,25 @@ class Database:
         self.conn.executescript(SCHEMA_SQL)
         # 轻量列迁移：旧库可能缺少 earliest_start_time 列
         self._ensure_column("tasks", "earliest_start_time", "TEXT")
+        # users 表迁移：旧版含 profile_id 列，与新设计不兼容，检测到则重建
+        self._migrate_users_table()
         self.conn.commit()
+
+    def _migrate_users_table(self) -> None:
+        """旧版 users 表带 profile_id（NOT NULL），与新 schema 冲突，重建之。"""
+        cols = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if cols and "profile_id" in cols:
+            self.conn.execute("DROP TABLE users")
+            self.conn.execute(
+                """CREATE TABLE users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )"""
+            )
 
     def _ensure_column(self, table: str, column: str, col_type: str) -> None:
         """如果列不存在则添加（兼容旧数据库）。"""
@@ -1088,6 +1112,36 @@ class Database:
             }
             for row in rows
         ]
+
+    # ==========================================
+    # 用户认证
+    # ==========================================
+    def create_user(self, username: str, password_hash: str) -> bool:
+        """注册新用户。用户名已存在时返回 False。"""
+        now = datetime.now().isoformat()
+        try:
+            self.conn.execute(
+                "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+                (username.strip(), password_hash, now),
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def get_user(self, username: str) -> Optional[sqlite3.Row]:
+        """按用户名查询用户，不存在返回 None。"""
+        return self.conn.execute(
+            "SELECT username, password_hash FROM users WHERE username = ?",
+            (username.strip(),),
+        ).fetchone()
+
+    def user_exists(self, username: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM users WHERE username = ?",
+            (username.strip(),),
+        ).fetchone()
+        return row is not None
 
     # ==========================================
     # LLM Cache

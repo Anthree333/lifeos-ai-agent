@@ -118,12 +118,25 @@ class LifeAgent:
         self._cancel_summary: str = ""
         self._cancel_removed_count: int = 0
 
+        # 对话澄清状态
+        self._clarification_slots: List[str] = []
+        self._clarification_message: str = ""
+
         # 内存状态（如果没有数据库，则纯内存运行）
         self._goals: List[Goal] = []
         self._tasks: List[Task] = []
         self._commitments: List[Commitment] = []
         self._snapshots: List[PlanSnapshot] = []
         self._execution_records: List[ExecutionRecord] = []
+
+        # 编排器（多 Agent 协作）
+        from .orchestrator import AgentOrchestrator
+        self.orchestrator = AgentOrchestrator(
+            parser=self.parser,
+            decomposer=self.decomposer,
+            scheduler=self.scheduler,
+            explainer=self.explainer,
+        )
 
         if self.db is not None:
             self.load_state()
@@ -652,6 +665,37 @@ class LifeAgent:
         now: Optional[datetime] = None,
         history: Optional[List[Dict[str, Any]]] = None,
     ) -> AgentResult:
+        """执行一轮 Agent 循环（委托给 Orchestrator）。
+
+        保持公共 API 不变，内部通过 AgentOrchestrator 编排。
+        """
+        if now is None:
+            now = datetime.now()
+
+        # 重置决策链
+        self.orchestrator.reset_trace()
+
+        # 委托给编排器
+        orch_result = self.orchestrator.run(
+            user_message, now=now, history=history, agent=self,
+        )
+
+        # 映射为 AgentResult
+        return AgentResult(
+            reply=orch_result.reply,
+            snapshot=orch_result.snapshot,
+            changed=orch_result.changed,
+            change_log=orch_result.change_log,
+            intent=orch_result.intent,
+            schedule_result=orch_result.schedule_result,
+        )
+
+    def _run_original(
+        self,
+        user_message: str,
+        now: Optional[datetime] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
+    ) -> AgentResult:
         """执行一轮 Agent 循环。
 
         核心流程：
@@ -669,6 +713,15 @@ class LifeAgent:
             "history": [dict(h) for h in (history or [])][-8:],
             "profile_name": self.profile.name,
         }
+
+        # 如果用户发的是新内容（非确认/否定），清除澄清状态
+        if self._clarification_slots and not self._is_affirmative(user_message) and not self._is_negative(user_message):
+            # 用户可能直接说了新目标，合并原消息
+            combined = self._clarification_message + " " + user_message
+            self._clarification_slots = []
+            self._clarification_message = ""
+            # 用合并后的消息重新解析
+            user_message = combined
 
         # ===== 待确认分支：肯定执行 / 否定取消 / 其他则覆盖 =====
         if self._pending_action is not None:
@@ -712,6 +765,31 @@ class LifeAgent:
 
         # 其他意图直接执行
         self._set_pending(None)
+
+        # 对话式澄清：parser 返回需要澄清时，反问用户
+        if (parse_result.dialogue_act == "clarify"
+                and parse_result.clarification_slots):
+            self._clarification_slots = parse_result.clarification_slots
+            self._clarification_message = user_message
+            slots_text = "、".join(parse_result.clarification_slots)
+            reply = f"好的，能补充一下{slots_text}吗？这样我能帮你更好地安排。"
+            return AgentResult(
+                reply=reply,
+                snapshot=self.current_snapshot,
+                changed=False,
+                intent=ParseIntent.UNKNOWN,
+            )
+
+        # 如果处于澄清状态，用户回复了新消息，合并后重新解析
+        if self._clarification_slots:
+            combined = self._clarification_message + " " + user_message
+            self._clarification_slots = []
+            self._clarification_message = ""
+            # 重新解析合并后的消息
+            parse_result = self.parser.parse(
+                combined, context=parse_context, now=now
+            )
+
         self._apply_parse_result(parse_result, now)
         need_replan = self._should_replan(parse_result)
         if need_replan:
@@ -726,6 +804,41 @@ class LifeAgent:
             ParseIntent.UNKNOWN,
         ):
             self.persist_state()
+        # 主动风险预警
+        result = self._check_and_append_risks(result, now)
+        return result
+
+    def _check_and_append_risks(
+        self,
+        result: AgentResult,
+        now: datetime,
+    ) -> AgentResult:
+        """检查风险并追加主动提醒到回复末尾。"""
+        try:
+            from ..scheduler.risk_predictor import RiskPredictor
+            risk_predictor = RiskPredictor()
+            risk_reports = risk_predictor.predict_all(
+                tasks=self._tasks,
+                all_records=self._execution_records,
+                now=now,
+            )
+            # 收集高风险告警
+            alerts = []
+            for report in risk_reports:
+                level = getattr(report, 'risk_level', '')
+                if hasattr(level, 'value'):
+                    level = level.value
+                if str(level) in ("critical", "high"):
+                    msg = getattr(report, 'message', '') or getattr(report, 'reason', '') or str(report)
+                    alerts.append(msg[:80])
+
+            if alerts:
+                risk_text = self.explainer.explain_proactively(alerts, self.current_snapshot)
+                if risk_text:
+                    result.reply = result.reply + "\n" + risk_text
+        except Exception:
+            pass  # 风险预警失败不影响主流程
+
         return result
 
     # ==========================================
@@ -1043,7 +1156,24 @@ class LifeAgent:
             except (ValueError, TypeError):
                 pass
 
-        tasks = self.decomposer.decompose(goal, deadline=deadline)
+        # 使用带上下文的智能分解（如果可用）
+        try:
+            decompose_result = self.decomposer.decompose_with_context(
+                goal,
+                deadline=deadline,
+                profile=self.profile,
+                existing_tasks=self._tasks,
+                execution_records=self._execution_records,
+                now=datetime.now(),
+            )
+            tasks = decompose_result.tasks
+            # 记录决策链
+            self.orchestrator.add_trace(
+                f"目标分解: {len(tasks)}个任务, 策略={decompose_result.breakdown_strategy}"
+            )
+        except (AttributeError, TypeError):
+            # 向后兼容：旧版 decomposer 没有 decompose_with_context
+            tasks = self.decomposer.decompose(goal, deadline=deadline)
 
         # 用户提到"明天/后天/下周…"等相对时间时，解析器会把它放进
         # goal_data["start_date"]（YYYY-MM-DD），表示任务最早从那一天开始
@@ -1169,6 +1299,20 @@ class LifeAgent:
 
     def _should_replan(self, result: ParseResult) -> bool:
         """判断是否需要重规划。"""
+        # 风险预警：高风险任务触发重规划
+        try:
+            from ..scheduler.risk_predictor import RiskPredictor
+            risk_predictor = RiskPredictor()
+            risk_reports = risk_predictor.predict_all(
+                tasks=self._tasks,
+                all_records=self._execution_records,
+                now=datetime.now(),
+            )
+            if any(getattr(r, 'risk_level', '') in ("critical", "high") for r in risk_reports):
+                return True
+        except Exception:
+            pass
+
         # 取消计划 → 只有真的删掉了东西才需要重排（优先判断，否则会被"无任务"分支拦下）
         if result.intent == ParseIntent.CANCEL_PLAN:
             return self._cancel_removed_count > 0

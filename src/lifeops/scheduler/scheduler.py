@@ -28,6 +28,7 @@ from ..models.schedule import (
 from .priority import TaskPriorityScorer, count_dependency_blocks
 from .constraints import ConstraintChecker, TimeSlotCandidate, ConstraintViolation
 from .sacrifice import SacrificeGenerator
+from .policy import SchedulePolicy
 
 
 @dataclass
@@ -66,6 +67,7 @@ class Scheduler:
         scorer: Optional[TaskPriorityScorer] = None,
         checker: Optional[ConstraintChecker] = None,
         sacrifice_gen: Optional[SacrificeGenerator] = None,
+        policy: Optional[SchedulePolicy] = None,
     ):
         self.profile = profile or StudentProfile()
         self.scorer = scorer or TaskPriorityScorer()
@@ -74,6 +76,24 @@ class Scheduler:
             min_progress_block_minutes=self.profile.min_progress_block_minutes,
         )
         self.sacrifice_gen = sacrifice_gen or SacrificeGenerator()
+        self._active_policy = policy or SchedulePolicy.default()
+
+    def schedule_with_policy(
+        self,
+        tasks: List[Task],
+        goals: List[Goal],
+        commitments: List[Commitment],
+        policy: SchedulePolicy,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        now: Optional[datetime] = None,
+    ) -> ScheduleResult:
+        """带策略的调度。
+
+        将给定策略设为活跃策略后执行调度。
+        """
+        self._active_policy = policy
+        return self.schedule(tasks, goals, commitments, start_date, end_date, now)
 
     def schedule(
         self,
@@ -434,17 +454,43 @@ class Scheduler:
         # 先按时间排序，再按精力分组
         scored_slots.sort(key=lambda x: (x[0].start, -x[1]))
 
-        for slot, _ in scored_slots:
+        # 连续性加成：同任务已安排的槽紧邻优先（减少碎片化）
+        # 计算 30 分钟内紧邻同任务槽的加成，使首次适应算法倾向连续块
+        task_scheduled_starts = [
+            datetime.fromisoformat(ts.start_time)
+            for ts in scheduled_slots
+            if ts.task_id == task.id
+        ]
+
+        def _contiguity_bonus(slot_start: datetime) -> float:
+            bonus = 0.0
+            for ts_start in task_scheduled_starts:
+                gap = abs((slot_start - ts_start).total_seconds() / 60)
+                if gap <= 30:  # 30 分钟内算紧邻
+                    bonus += 0.3
+            return bonus
+
+        scored_slots_with_cont = [
+            (slot, energy_score + _contiguity_bonus(slot.start))
+            for slot, energy_score in scored_slots
+        ]
+        # 排序仍以时间为主键，连续性仅在同期内起 tie-break 作用，保证默认确定性
+        scored_slots_with_cont.sort(key=lambda x: (x[0].start, -(x[1])))
+
+        policy = self._active_policy
+
+        for slot, _ in scored_slots_with_cont:
             if remaining_minutes <= 0:
                 break
 
             slot_duration = int((slot.end - slot.start).total_seconds() / 60)
 
-            # 计算实际可用时长（不超过还需要的）
+            # 计算实际可用时长（不超过还需要的，且单次不超过专注上限）
             actual_minutes = min(
                 slot_duration,
                 remaining_minutes,
                 remaining.get(task.id, 0),
+                policy.max_focus_block_minutes,
             )
             # 最小 15 分钟规则不阻止“刚好收尾”的短片段
             if actual_minutes < 15 and remaining_minutes > actual_minutes:
@@ -452,6 +498,25 @@ class Scheduler:
 
             # 创建时间槽
             end_time = slot.start + timedelta(minutes=actual_minutes)
+
+            # 硬截止安全余量：优先选择能在 deadline 前 safety_margin_days 天完成的槽
+            # 仅当 deadline 距当前槽起点足够远时才要求余量，
+            # 避免临近 deadline 时过度严格导致任务排不下
+            if (
+                task.deadline_type == DeadlineType.HARD
+                and task.deadline
+                and policy.hard_deadline_safety_margin_days > 0
+            ):
+                try:
+                    dl = datetime.fromisoformat(task.deadline)
+                    margin = timedelta(
+                        days=policy.hard_deadline_safety_margin_days
+                    )
+                    if dl - slot.start > margin and end_time + margin > dl:
+                        continue  # 跳过这个槽，找更早的
+                except (ValueError, TypeError):
+                    pass
+
             ts = TimeSlot(
                 id=str(uuid.uuid4()),
                 task_id=task.id,
@@ -488,15 +553,74 @@ class Scheduler:
         time_slots: List[TimeSlot],
         buffer_minutes: int,
     ) -> List[TimeSlot]:
-        """在任务之间插入缓冲时间。
+        """在任务之间插入缓冲时间槽。
 
-        注意：这会减少实际可用时间。
-        简化实现：将缓冲从任务时间中扣除，不额外加缓冲槽。
-        只在结果中记录缓冲信息。
+        不同任务之间插入 BUFFER 类型 TimeSlot 填补小间隙。
+        连续同任务的块之间不插缓冲。
+        超过 max_daily_minutes 时插入 REST 类型槽。
         """
-        # 按开始时间排序
+        if not time_slots:
+            return time_slots
+
+        policy = self._active_policy
         sorted_slots = sorted(time_slots, key=lambda ts: ts.start_time)
-        return sorted_slots
+
+        result: List[TimeSlot] = []
+        # 追踪每天已安排的学习分钟数
+        daily_minutes: Dict[str, int] = {}
+
+        for i, ts in enumerate(sorted_slots):
+            if ts.source != TimeSlotSource.TASK:
+                result.append(ts)
+                continue
+
+            # 计算日期 key
+            ts_date = datetime.fromisoformat(ts.start_time).strftime("%Y-%m-%d")
+
+            # 检查是否需要插入休息槽（超过每日上限）
+            current_daily = daily_minutes.get(ts_date, 0)
+            if policy.max_daily_minutes > 0 and current_daily >= policy.max_daily_minutes:
+                # 插入 REST 槽
+                ts_start_dt = datetime.fromisoformat(ts.start_time)
+                rest_ts = TimeSlot(
+                    id=str(uuid.uuid4()),
+                    task_id="",
+                    start_time=ts.start_time,
+                    end_time=(ts_start_dt + timedelta(minutes=30)).isoformat(),
+                    energy_level=EnergyLevel.LOW,
+                    is_fixed=True,
+                    source=TimeSlotSource.REST,
+                    title="休息时间",
+                )
+                result.append(rest_ts)
+                daily_minutes[ts_date] = 0  # 重置
+
+            # 如果不是第一个，且与前一个不同任务，插入缓冲填补小间隙
+            if i > 0 and result:
+                prev = result[-1]
+                if prev.source == TimeSlotSource.TASK and prev.task_id != ts.task_id:
+                    prev_end = datetime.fromisoformat(prev.end_time)
+                    curr_start = datetime.fromisoformat(ts.start_time)
+                    gap = (curr_start - prev_end).total_seconds() / 60
+
+                    # 如果间隙小于策略缓冲时间，插入 BUFFER 槽填补
+                    if 0 < gap < policy.buffer_between_tasks:
+                        buffer_ts = TimeSlot(
+                            id=str(uuid.uuid4()),
+                            task_id="",
+                            start_time=prev_end.isoformat(),
+                            end_time=(prev_end + timedelta(minutes=int(gap))).isoformat(),
+                            energy_level=EnergyLevel.LOW,
+                            is_fixed=False,
+                            source=TimeSlotSource.BUFFER,
+                            title="缓冲",
+                        )
+                        result.append(buffer_ts)
+
+            result.append(ts)
+            daily_minutes[ts_date] = daily_minutes.get(ts_date, 0) + ts.duration_minutes
+
+        return result
 
     def _commitments_to_slots(self, commitments: List[Commitment]) -> List[TimeSlot]:
         """将承诺转换为 TimeSlot（固定时间槽）。"""

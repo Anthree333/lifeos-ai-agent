@@ -8,6 +8,7 @@ from .scheduler import Scheduler, ScheduleResult
 from .priority import TaskPriorityScorer
 from .constraints import ConstraintChecker, ConstraintViolation
 from .sacrifice import SacrificeGenerator
+from .policy import SchedulePolicy
 
 __all__ = [
     "Scheduler",
@@ -16,4 +17,5 @@ __all__ = [
     "ConstraintChecker",
     "ConstraintViolation",
     "SacrificeGenerator",
+    "SchedulePolicy",
 ]

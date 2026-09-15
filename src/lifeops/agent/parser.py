@@ -46,6 +46,48 @@ class ParseResult:
 
     raw_response: Dict = field(default_factory=dict)
 
+    # 新增：对话澄清支持
+    clarification_slots: List[str] = field(default_factory=list)  # 待澄清槽位
+    dialogue_act: str = ""  # 对话行为标签（confirm/deny/clarify/new_topic）
+
+
+CLASSIFY_PROMPT = """你是 LifeOS 的意图分类器。只做意图分类，不做槽位提取。
+
+意图分类：
+- progress_report: 进度汇报（"完成了X%"、"做了Y小时"）
+- new_goal: 新目标（"我要..."、"准备..."）
+- new_event: 新事件（"考试改期"、"生病了"）
+- status_query: 状态查询（"进度怎么样？"）
+- cancel_plan: 取消计划（"取消..."、"删除..."）
+- unknown: 无法识别
+
+判断规则：
+- "去学习/复习/写作业"等用户给自己安排的任务时间点，是 new_goal 不是 new_event
+- "不去/不参加某活动"是 cancel_plan 不是 new_event
+- "取消/删除...计划"是 cancel_plan 不是 status_query
+- 信息不足无法确定具体意图时，设 needs_clarification=true
+
+输出 JSON：
+{"intent": "...", "confidence": 0.0-1.0, "needs_clarification": bool, "missing_slots": ["title","deadline"]}
+"""
+
+EXTRACT_PROMPT = """你是 LifeOS 的信息提取器。根据已确定的意图，从用户消息中提取结构化数据。
+
+各意图的数据格式：
+
+1. progress_report: {"updates": [{"task_title": "...", "progress": 0.3, "actual_minutes": 120, "note": "..."}]}
+   - progress 是总进度（30%=0.3），只有"又/再完成"才是增量
+
+2. new_goal: {"title": "...", "description": "...", "deadline": "YYYY-MM-DD 或 null", "weight": 0.5}
+
+3. new_event: {"events": [{"title": "...", "event_type": "...", "event_time": "...", "change_content": "..."}]}
+
+4. status_query: {"query_type": "progress|plan|risk|all"}
+
+5. cancel_plan: {"target_type": "goal|task|commitment|date|all", "keyword": "...", "date": "YYYY-MM-DD 或 null"}
+
+注意：只输出 JSON，信息不足时留空不编造。
+"""
 
 SYSTEM_PROMPT = """你是 LifeOS 的输入解析器。你的任务是将用户的自然语言消息解析为结构化数据。
 
@@ -184,6 +226,9 @@ class InputParser:
     ) -> ParseResult:
         """解析用户消息。
 
+        两阶段解析：先分类意图，再提取槽位。
+        Mock 模式或 LLM 不可用时，走规则兜底。
+
         Args:
             user_message: 用户自然语言输入
             context: 可选上下文（当前任务列表等，帮助解析）
@@ -195,8 +240,11 @@ class InputParser:
         if now is None:
             now = datetime.now()
 
-        # 取消类语句优先用确定性规则识别，避免被"我要取消…"误判成新目标、
-        # 或被"…计划"字样误判成状态查询
+        # 空输入直接返回 UNKNOWN
+        if not user_message.strip():
+            return ParseResult(intent=ParseIntent.UNKNOWN, confidence=0.3)
+
+        # 1. 取消意图优先（确定性规则，避免被"我要取消…"误判成新目标）
         cancel_data = self._parse_cancel_request(user_message, now=now)
         if cancel_data is not None:
             return ParseResult(
@@ -205,15 +253,53 @@ class InputParser:
                 cancel_data=cancel_data,
             )
 
-        # 明确的目标句优先走确定性规则，避免模型误判成“事件”
+        # 2. 纯确认/否定词检测
+        if self._is_affirmative_only(user_message):
+            return ParseResult(
+                intent=ParseIntent.UNKNOWN,
+                confidence=0.5,
+                dialogue_act="confirm",
+            )
+        if self._is_denial_only(user_message):
+            return ParseResult(
+                intent=ParseIntent.UNKNOWN,
+                confidence=0.5,
+                dialogue_act="deny",
+            )
+
+        # 3. 明确目标句优先走规则，避免模型误判成事件
         if self._is_explicit_goal_phrase(user_message):
             return self._rule_based_parse(user_message, now=now)
 
-        # Mock 模式或 LLM 不可用时，用规则解析兜底
+        # 4. Mock 模式或 LLM 不可用，走规则
         if self.llm is None or self.llm.mock_mode:
             return self._rule_based_parse(user_message, now=now)
 
-        # 构建上下文提示
+        # 5. LLM 两阶段：分类 → 提取
+        try:
+            classify_result = self._classify_intent(user_message, context, now)
+            if classify_result.get("needs_clarification"):
+                return ParseResult(
+                    intent=ParseIntent.UNKNOWN,
+                    confidence=classify_result.get("confidence", 0.5),
+                    clarification_slots=classify_result.get("missing_slots", []),
+                    dialogue_act="clarify",
+                )
+            extracted = self._extract_slots(
+                user_message, classify_result["intent"], context, now
+            )
+            return self._build_result(
+                extracted, user_message=user_message, now=now
+            )
+        except Exception:
+            return self._rule_based_parse(user_message, now=now)
+
+    def _build_context_prompt(
+        self,
+        context: Optional[Dict],
+        now: datetime,
+    ) -> str:
+        """构建上下文提示（任务列表、历史对话、确认状态、日期）。"""
         context_prompt = ""
         if context and context.get("profile_name"):
             context_prompt += f"\n用户姓名：{context['profile_name']}"
@@ -238,37 +324,63 @@ class InputParser:
                 "\n注意：这是用户对上一条消息的确认回复，请把上面的消息归类为最具体的意图"
                 "（new_goal / new_event / progress_report / status_query），除非它明显不是。"
             )
-
         weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-        date_prompt = (
+        context_prompt += (
             f"\n今天是 {now.strftime('%Y-%m-%d %H:%M')}（{weekday_names[now.weekday()]}）。"
         )
+        return context_prompt
 
-        user_prompt = f"用户消息：{user_message}{context_prompt}{date_prompt}\n\n请解析并输出 JSON。"
-
+    def _classify_intent(
+        self,
+        user_message: str,
+        context: Optional[Dict],
+        now: datetime,
+    ) -> Dict:
+        """LLM 第一阶段：意图分类。"""
+        context_prompt = self._build_context_prompt(context, now)
+        user_prompt = (
+            f"用户消息：{user_message}{context_prompt}\n\n"
+            f"请只做意图分类并输出 JSON。"
+        )
         messages = [
-            ChatMessage(ChatRole.SYSTEM, SYSTEM_PROMPT),
+            ChatMessage(ChatRole.SYSTEM, CLASSIFY_PROMPT),
             ChatMessage(ChatRole.USER, user_prompt),
         ]
+        return self.llm.chat_json(messages, temperature=0.1)
 
-        # LLM 解析失败时重试一次（跳过缓存），仍失败再用规则兜底
-        for attempt, skip in enumerate((False, True)):
-            try:
-                response = self.llm.chat_json(
-                    messages, temperature=0.1, skip_cache=skip
-                )
-                if response:
-                    return self._build_result(response, now=now)
-            except Exception:
-                if attempt == 1:
-                    break
-
-        # LLM 失败，用规则兜底
-        return self._rule_based_parse(user_message, now=now)
+    def _extract_slots(
+        self,
+        user_message: str,
+        intent_str: str,
+        context: Optional[Dict],
+        now: datetime,
+    ) -> Dict:
+        """LLM 第二阶段：槽位提取。"""
+        context_prompt = self._build_context_prompt(context, now)
+        user_prompt = (
+            f"用户消息：{user_message}{context_prompt}\n\n"
+            f"当前意图：{intent_str}。请提取该意图所需的结构化数据，只输出 JSON。"
+        )
+        messages = [
+            ChatMessage(ChatRole.SYSTEM, EXTRACT_PROMPT),
+            ChatMessage(ChatRole.USER, user_prompt),
+        ]
+        slots = self.llm.chat_json(messages, temperature=0.1)
+        # 兼容 LLM 返回完整响应格式（含 intent/confidence/data）或纯数据
+        if isinstance(slots, dict) and "data" in slots and isinstance(slots["data"], dict):
+            extracted_data = slots["data"]
+        else:
+            extracted_data = slots if isinstance(slots, dict) else {}
+        return {
+            "intent": intent_str,
+            "confidence": 0.8,
+            "data": extracted_data,
+        }
 
     def _build_result(
         self,
         response: Dict,
+        user_message: str = "",
         now: Optional[datetime] = None,
     ) -> ParseResult:
         """从 LLM 响应构建 ParseResult。"""
@@ -408,6 +520,16 @@ class InputParser:
         }
         t = text.strip().lower().strip("，。,.！！?？")
         return len(t) <= 10 and t in affirmative
+
+    @staticmethod
+    def _is_denial_only(text: str) -> bool:
+        """判断是否是纯粹的否定回复。"""
+        denials = {
+            "不用了", "不要了", "算了", "取消", "不用", "不要",
+            "不", "不是", "没有", "没", "no", "nope",
+        }
+        t = text.strip().lower().strip("，。,.！?？")
+        return len(t) <= 10 and t in denials
 
     @staticmethod
     def _clean_goal_title(text: str) -> str:
@@ -604,7 +726,7 @@ class InputParser:
         """基于规则的兜底解析（Mock 模式使用）。"""
         msg = user_message.lower()
 
-        # 取消计划检测（必须放在状态查询之前，避免"取消…计划"被当成查询）
+        # 取消计划检测（已在 parse() 处理，这里保留作为兜底）
         cancel_data = self._parse_cancel_request(user_message, now=now)
         if cancel_data is not None:
             return ParseResult(
@@ -613,21 +735,11 @@ class InputParser:
                 cancel_data=cancel_data,
             )
 
-        # 状态查询检测（先于进度汇报，因为"进度如何"是查询不是汇报）
-        if any(w in user_message for w in ["怎么样", "如何", "看看", "状态", "进度如何", "计划", "情况"]):
-            # 排除纯数字百分比的情况（那是汇报）
-            import re
-            if not re.search(r"\d+\s*%", user_message) or "怎么样" in user_message or "如何" in user_message:
-                return ParseResult(
-                    intent=ParseIntent.STATUS_QUERY,
-                    confidence=0.7,
-                    query_type="all",
-                )
-
-        # 进度汇报检测
-        import re
+        # 进度汇报检测（必须在状态查询之前，避免"完成了30%"被误判为查询）
         progress_match = re.search(r"(\d+)\s*%", user_message)
-        if "完成" in msg or "做完" in msg or progress_match:
+        has_progress_verb = "完成" in msg or "做完" in msg
+        has_quantity = bool(re.search(r"\d+", user_message))
+        if progress_match or (has_progress_verb and has_quantity):
             progress = 0.0
             if progress_match:
                 progress = int(progress_match.group(1)) / 100.0
@@ -690,13 +802,14 @@ class InputParser:
                 life_events=[event],
             )
 
-        # 状态查询检测
-        if any(w in msg for w in ["怎么样", "如何", "看看", "状态", "进度如何", "计划"]):
-            return ParseResult(
-                intent=ParseIntent.STATUS_QUERY,
-                confidence=0.7,
-                query_type="all",
-            )
+        # 状态查询检测（不含数字百分比，避免误拦进度汇报）
+        if any(w in user_message for w in ["怎么样", "如何", "看看", "状态", "进度如何", "计划", "情况"]):
+            if not re.search(r"\d+\s*%", user_message):
+                return ParseResult(
+                    intent=ParseIntent.STATUS_QUERY,
+                    confidence=0.7,
+                    query_type="all",
+                )
 
         # 默认：无法识别
         return ParseResult(

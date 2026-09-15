@@ -8,6 +8,9 @@ from __future__ import annotations
 import os
 import sys
 import json
+import time
+import uuid
+import threading
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any
@@ -23,26 +26,41 @@ from lifeops.models import (
 )
 from lifeops.agent import LifeAgent
 from lifeops.storage.database import get_db
+from lifeops.logger import get_logger
+
+
+logger = get_logger("lifeos.mcp")
 
 
 # 创建 MCP 服务器实例
 mcp = MCPServer("lifeos-tools")
 
-# 全局 Agent 实例（懒加载）
+# 全局 Agent 实例（懒加载 + 线程安全）
 _agent: Optional[LifeAgent] = None
+_agent_lock = threading.Lock()
+# 写操作全局锁，避免并发修改计划导致状态不一致
+_write_lock = threading.Lock()
 
 
 def get_agent() -> LifeAgent:
-    """获取或创建全局 Agent 实例。"""
+    """获取或创建全局 Agent 实例（线程安全的懒加载）。"""
     global _agent
     if _agent is None:
-        default_db_path = str(
-            Path(__file__).resolve().parent.parent / "data" / "lifeos.db"
-        )
-        db = get_db(os.environ.get("DB_PATH") or default_db_path)
-        profile = db.get_default_profile()
-        _agent = LifeAgent(profile=profile, db=db)
+        with _agent_lock:
+            if _agent is None:
+                default_db_path = str(
+                    Path(__file__).resolve().parent.parent / "data" / "lifeos.db"
+                )
+                db = get_db(os.environ.get("DB_PATH") or default_db_path)
+                profile = db.get_default_profile()
+                _agent = LifeAgent(profile=profile, db=db)
+                logger.info("Agent 实例初始化完成")
     return _agent
+
+
+def _new_trace_id() -> str:
+    """生成请求追踪 ID。"""
+    return uuid.uuid4().hex[:12]
 
 
 # ==========================================
@@ -65,14 +83,29 @@ def create_goal(title: str, description: str = "", weight: float = 0.5,
     Returns:
         包含目标信息、任务列表和计划摘要的字典
     """
+    trace_id = _new_trace_id()
+    t0 = time.time()
     agent = get_agent()
 
-    # 结构化建目标，避免自然语言规则吞掉 deadline/weight
-    result = agent.create_goal_structured(
-        title=title,
-        description=description,
-        weight=weight,
-        deadline=deadline,
+    try:
+        with _write_lock:
+            # 结构化建目标，避免自然语言规则吞掉 deadline/weight
+            result = agent.create_goal_structured(
+                title=title,
+                description=description,
+                weight=weight,
+                deadline=deadline,
+            )
+    except Exception as e:
+        logger.exception("[%s] create_goal 失败: title=%s", trace_id, title)
+        return {"success": False, "error": str(e), "trace_id": trace_id}
+
+    elapsed = (time.time() - t0) * 1000
+    logger.info(
+        "[%s] create_goal 成功: title=%s, tasks=%d, minutes=%d, %.0fms",
+        trace_id, title, len(agent._tasks),
+        result.snapshot.total_scheduled_minutes if result.snapshot else 0,
+        elapsed,
     )
 
     # 格式化响应
@@ -96,6 +129,7 @@ def create_goal(title: str, description: str = "", weight: float = 0.5,
         "total_minutes": result.snapshot.total_scheduled_minutes if result.snapshot else 0,
         "sacrifice_count": len(result.snapshot.sacrifice_list) if result.snapshot else 0,
         "explanation": result.reply,
+        "trace_id": trace_id,
     }
 
     return response
@@ -115,13 +149,26 @@ def report_progress(task_id: str = "", progress: float = 0.0,
     Returns:
         包含更新后状态和计划变更的字典
     """
+    trace_id = _new_trace_id()
+    t0 = time.time()
     agent = get_agent()
 
-    result = agent.report_absolute_progress(
-        task_id=task_id,
-        progress=progress,
-        actual_minutes=actual_minutes,
-        note=note,
+    try:
+        with _write_lock:
+            result = agent.report_absolute_progress(
+                task_id=task_id,
+                progress=progress,
+                actual_minutes=actual_minutes,
+                note=note,
+            )
+    except Exception as e:
+        logger.exception("[%s] report_progress 失败: task_id=%s", trace_id, task_id)
+        return {"success": False, "error": str(e), "trace_id": trace_id}
+
+    elapsed = (time.time() - t0) * 1000
+    logger.info(
+        "[%s] report_progress: task_id=%s, progress=%.2f, plan_changed=%s, %.0fms",
+        trace_id, task_id or "<auto>", progress, result.changed, elapsed,
     )
 
     response = {
@@ -129,6 +176,7 @@ def report_progress(task_id: str = "", progress: float = 0.0,
         "plan_changed": result.changed,
         "explanation": result.reply,
         "total_minutes": result.snapshot.total_scheduled_minutes if result.snapshot else 0,
+        "trace_id": trace_id,
     }
 
     return response
@@ -254,6 +302,8 @@ def add_commitment(title: str, start_time: str, end_time: str,
     Returns:
         添加结果
     """
+    trace_id = _new_trace_id()
+    t0 = time.time()
     agent = get_agent()
 
     valid_types = {t.value for t in CommitmentType}
@@ -270,10 +320,21 @@ def add_commitment(title: str, start_time: str, end_time: str,
         end_time=end_time,
         recurrence=recurrence,
     )
-    agent.add_commitment(commitment)
 
-    # 直接强制重排，不依赖自然语言意图
-    result = agent.force_replan(reason=f"新增固定承诺：{title}")
+    try:
+        with _write_lock:
+            agent.add_commitment(commitment)
+            # 直接强制重排，不依赖自然语言意图
+            result = agent.force_replan(reason=f"新增固定承诺：{title}")
+    except Exception as e:
+        logger.exception("[%s] add_commitment 失败: title=%s", trace_id, title)
+        return {"success": False, "error": str(e), "trace_id": trace_id}
+
+    elapsed = (time.time() - t0) * 1000
+    logger.info(
+        "[%s] add_commitment 成功: title=%s, plan_updated=%s, %.0fms",
+        trace_id, title, result.changed, elapsed,
+    )
 
     return {
         "success": True,
@@ -281,6 +342,7 @@ def add_commitment(title: str, start_time: str, end_time: str,
         "message": f"已添加承诺：{title}",
         "plan_updated": result.changed,
         "total_minutes": result.snapshot.total_scheduled_minutes if result.snapshot else 0,
+        "trace_id": trace_id,
     }
 
 
@@ -297,14 +359,31 @@ def chat(message: str) -> dict:
     Returns:
         LifeOS 的回复和相关信息
     """
+    trace_id = _new_trace_id()
+    t0 = time.time()
     agent = get_agent()
-    result = agent.run(message)
+
+    try:
+        with _write_lock:
+            result = agent.run(message)
+    except Exception as e:
+        logger.exception("[%s] chat 失败", trace_id)
+        return {"success": False, "error": str(e), "trace_id": trace_id}
+
+    elapsed = (time.time() - t0) * 1000
+    logger.info(
+        "[%s] chat: intent=%s, plan_changed=%s, %.0fms",
+        trace_id,
+        result.intent.value if hasattr(result.intent, 'value') else result.intent,
+        result.changed, elapsed,
+    )
 
     response = {
         "reply": result.reply,
         "plan_changed": result.changed,
         "intent": result.intent.value if hasattr(result.intent, 'value') else result.intent,
         "has_snapshot": result.snapshot is not None,
+        "trace_id": trace_id,
     }
 
     if result.snapshot:
@@ -381,10 +460,11 @@ def main():
     except ImportError:
         pass
 
-    print("[lifeops-mcp] 服务器启动（stdio 模式）", file=sys.stderr)
-    print(f"[lifeops-mcp] 可用工具：create_goal, report_progress, get_current_plan, "
-          f"get_task_list, add_commitment, chat, echo, system_now",
-          file=sys.stderr)
+    logger.info("MCP 服务器启动（stdio 模式）")
+    logger.info(
+        "可用工具：create_goal, report_progress, get_current_plan, "
+        "get_task_list, add_commitment, chat, echo, system_now"
+    )
     mcp.run(transport="stdio")
 
 

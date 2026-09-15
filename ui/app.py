@@ -1009,6 +1009,422 @@ st.markdown("""
 
 
 # ==========================================
+# 登录认证
+# ==========================================
+import hashlib
+
+
+def _hash_pwd(pwd: str) -> str:
+    """对密码做 sha256 哈希，避免明文比对。"""
+    return hashlib.sha256(pwd.encode("utf-8")).hexdigest()
+
+
+def _get_auth_credentials() -> tuple[str, str]:
+    """从环境变量读取账号密码，未配置时返回演示默认值。
+
+    默认账号：admin / lifeos2026（仅用于本地演示，生产环境务必通过
+    LIFEOS_USERNAME / LIFEOS_PASSWORD 环境变量覆盖）。
+    """
+    username = os.environ.get("LIFEOS_USERNAME", "admin").strip()
+    password = os.environ.get("LIFEOS_PASSWORD", "lifeos2026")
+    return username, _hash_pwd(password)
+
+
+def _check_credentials(username: str, password: str) -> bool:
+    """校验用户名密码：先查数据库注册用户，再回退到环境变量默认账号。"""
+    if not username or not password:
+        return False
+    import hmac
+    # 1. 数据库注册用户
+    try:
+        db = get_db()
+        user = db.get_user(username)
+        if user is not None:
+            return hmac.compare_digest(_hash_pwd(password), user["password_hash"])
+    except Exception:
+        pass
+    # 2. 环境变量默认账号（兜底）
+    expected_user, expected_pwd_hash = _get_auth_credentials()
+    user_ok = hmac.compare_digest(username.strip(), expected_user)
+    pwd_ok = hmac.compare_digest(_hash_pwd(password), expected_pwd_hash)
+    return user_ok and pwd_ok
+
+
+def _register_user(username: str, password: str) -> tuple[bool, str]:
+    """注册新用户。返回 (是否成功, 消息)。"""
+    username = (username or "").strip()
+    if not username or not password:
+        return False, "用户名和密码不能为空"
+    if len(username) < 2:
+        return False, "用户名至少 2 个字符"
+    if len(password) < 4:
+        return False, "密码至少 4 个字符"
+    if len(username) > 32:
+        return False, "用户名不能超过 32 个字符"
+    try:
+        db = get_db()
+        # 不允许与默认管理员账号重名
+        default_user, _ = _get_auth_credentials()
+        if username == default_user:
+            return False, "该用户名已被占用"
+        ok = db.create_user(username, _hash_pwd(password))
+        if ok:
+            return True, "注册成功"
+        return False, "该用户名已被占用"
+    except Exception as e:
+        return False, f"注册失败：{e}"
+
+
+def _is_authenticated() -> bool:
+    return bool(st.session_state.get("authenticated", False))
+
+
+def _render_login_screen() -> None:
+    """渲染居中的登录卡片，未登录时调用并 st.stop()。"""
+    st.markdown("""
+    <style>
+    html, body, [data-testid="stAppViewContainer"] {
+        overflow: hidden !important;
+        height: 100vh !important;
+    }
+    /* 动态渐变背景：缓慢流动 */
+    [data-testid="stAppViewContainer"] {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%) !important;
+        background-size: 200% 200% !important;
+        animation: gradientShift 15s ease infinite !important;
+    }
+    @keyframes gradientShift {
+        0%   { background-position: 0% 50%; }
+        50%  { background-position: 100% 50%; }
+        100% { background-position: 0% 50%; }
+    }
+    /* 浮动光斑装饰 */
+    [data-testid="stAppViewContainer"]::before {
+        content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+        background:
+            radial-gradient(circle at 15% 25%, rgba(255,255,255,0.22) 0%, transparent 35%),
+            radial-gradient(circle at 85% 75%, rgba(255,255,255,0.16) 0%, transparent 35%),
+            radial-gradient(circle at 50% 50%, rgba(255,255,255,0.06) 0%, transparent 50%);
+        animation: orbFloat 12s ease-in-out infinite;
+    }
+    @keyframes orbFloat {
+        0%, 100% { transform: scale(1) translate(0, 0); }
+        50%      { transform: scale(1.08) translate(-2%, 2%); }
+    }
+
+    /* 居中容器 */
+    .block-container {
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+        max-width: 100% !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        min-height: 100vh !important;
+    }
+
+    /* 登录卡片：毛玻璃 + 发光边框 + 入场动画 */
+    section[data-testid="stMain"] > div > div {
+        background: rgba(255,255,255,0.85) !important;
+        backdrop-filter: blur(24px) saturate(180%) !important;
+        -webkit-backdrop-filter: blur(24px) saturate(180%) !important;
+        border-radius: 24px !important;
+        padding: 30px 32px 20px !important;
+        max-width: 380px !important;
+        width: 100% !important;
+        margin: 0 auto !important;
+        box-shadow:
+            0 24px 60px rgba(15,23,42,0.30),
+            0 0 0 1px rgba(255,255,255,0.5) inset,
+            0 0 40px rgba(102,126,234,0.15) !important;
+        border: 1px solid rgba(255,255,255,0.55) !important;
+        animation: cardIn 0.6s cubic-bezier(0.16, 1, 0.3, 1) both !important;
+        position: relative !important;
+        z-index: 1 !important;
+    }
+    @keyframes cardIn {
+        from { opacity: 0; transform: translateY(18px) scale(0.97); }
+        to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    /* Logo：渐变方块 + 脉冲发光 */
+    .login-logo {
+        width: 52px; height: 52px; border-radius: 16px;
+        background: linear-gradient(135deg, #667eea, #764ba2);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 24px; margin: 0 auto 10px;
+        box-shadow: 0 8px 24px rgba(102,126,234,0.5);
+        animation: logoPulse 3s ease-in-out infinite;
+    }
+    @keyframes logoPulse {
+        0%, 100% { box-shadow: 0 8px 24px rgba(102,126,234,0.5); }
+        50%      { box-shadow: 0 8px 32px rgba(118,75,162,0.65); }
+    }
+    .login-title {
+        text-align: center; font-size: 1.35rem; font-weight: 700;
+        color: #0f172a; margin: 0 0 3px; letter-spacing: -0.3px;
+    }
+    .login-subtitle {
+        text-align: center; font-size: 0.78rem; color: #64748b;
+        margin: 0 0 16px;
+    }
+
+    /* 隐藏 Streamlit 默认元素 */
+    [data-testid="stHeader"], [data-testid="stSidebar"],
+    [data-testid="stToolbar"], #MainMenu, footer {
+        display: none !important;
+    }
+
+    /* 输入框美化 */
+    [data-testid="stMain"] [data-testid="stTextInput"] {
+        margin-bottom: 10px;
+    }
+    [data-testid="stMain"] [data-testid="stTextInput"] label {
+        font-size: 0.78rem; font-weight: 600; color: #475569;
+        margin-bottom: 4px;
+    }
+    [data-testid="stMain"] [data-testid="stTextInput"] input {
+        border-radius: 12px !important;
+        border: 1.5px solid #e2e8f0 !important;
+        padding: 10px 14px !important;
+        font-size: 0.9rem !important;
+        background: rgba(255,255,255,0.9) !important;
+        transition: all 0.2s ease !important;
+    }
+    [data-testid="stMain"] [data-testid="stTextInput"] input:focus {
+        border-color: #667eea !important;
+        box-shadow: 0 0 0 4px rgba(102,126,234,0.15) !important;
+        outline: none !important;
+    }
+    [data-testid="stMain"] [data-testid="stTextInput"] input::placeholder {
+        color: #94a3b8 !important;
+    }
+
+    /* 登录按钮：渐变 + 悬停 */
+    [data-testid="stMain"] [data-testid="stFormSubmitButton"] button {
+        background: linear-gradient(135deg, #667eea, #764ba2) !important;
+        border: none !important;
+        border-radius: 12px !important;
+        font-weight: 600 !important;
+        font-size: 0.92rem !important;
+        padding: 10px 0 !important;
+        letter-spacing: 2px !important;
+        box-shadow: 0 6px 18px rgba(102,126,234,0.4) !important;
+        transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        margin-top: 4px !important;
+    }
+    [data-testid="stMain"] [data-testid="stFormSubmitButton"] button:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 10px 26px rgba(102,126,234,0.55) !important;
+    }
+    [data-testid="stMain"] [data-testid="stFormSubmitButton"] button:active {
+        transform: translateY(0) !important;
+    }
+
+    /* 提示文字 */
+    [data-testid="stMain"] [data-testid="stCaptionContainer"] {
+        margin-top: 10px !important;
+        text-align: center !important;
+        padding-bottom: 0 !important;
+    }
+    [data-testid="stMain"] [data-testid="stCaptionContainer"] p {
+        font-size: 0.72rem !important;
+        color: #94a3b8 !important;
+    }
+    /* 错误提示 */
+    [data-testid="stMain"] [data-testid="stAlert"] {
+        margin-bottom: 8px !important;
+        border-radius: 10px !important;
+    }
+    </style>
+    <div class="login-logo">✨</div>
+    <h1 class="login-title">LifeOS</h1>
+    <p class="login-subtitle">AI 学习管家 · 登录以继续</p>
+    """, unsafe_allow_html=True)
+
+    with st.form("login_form", clear_on_submit=False):
+        username = st.text_input("用户名", key="login_username",
+                                 placeholder="请输入用户名")
+        password = st.text_input("密码", key="login_password",
+                                 type="password", placeholder="请输入密码")
+        submitted = st.form_submit_button("登 录", use_container_width=True,
+                                          type="primary")
+
+    if submitted:
+        if _check_credentials(username, password):
+            st.session_state["authenticated"] = True
+            st.session_state["username"] = username.strip()
+            st.session_state["login_error"] = None
+            st.rerun()
+        else:
+            st.session_state["login_error"] = "用户名或密码错误，请重试"
+
+    if st.session_state.get("login_error"):
+        st.error(st.session_state["login_error"])
+
+    st.caption("演示账号：admin / lifeos2026")
+
+    # 切换到注册页（通栏按钮，避免文字截断）
+    if st.button("没有账号？立即注册", key="go_register",
+                 use_container_width=True):
+        st.session_state["auth_view"] = "register"
+        st.session_state["login_error"] = None
+        st.rerun()
+    st.stop()
+
+
+def _render_register_screen() -> None:
+    """渲染注册页面。"""
+    # 复用登录页的背景与卡片样式
+    st.markdown("""
+    <style>
+    html, body, [data-testid="stAppViewContainer"] {
+        overflow: hidden !important;
+        height: 100vh !important;
+    }
+    [data-testid="stAppViewContainer"] {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%) !important;
+        background-size: 200% 200% !important;
+        animation: gradientShift 15s ease infinite !important;
+    }
+    @keyframes gradientShift {
+        0%   { background-position: 0% 50%; }
+        50%  { background-position: 100% 50%; }
+        100% { background-position: 0% 50%; }
+    }
+    [data-testid="stAppViewContainer"]::before {
+        content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+        background:
+            radial-gradient(circle at 15% 25%, rgba(255,255,255,0.22) 0%, transparent 35%),
+            radial-gradient(circle at 85% 75%, rgba(255,255,255,0.16) 0%, transparent 35%),
+            radial-gradient(circle at 50% 50%, rgba(255,255,255,0.06) 0%, transparent 50%);
+        animation: orbFloat 12s ease-in-out infinite;
+    }
+    @keyframes orbFloat {
+        0%, 100% { transform: scale(1) translate(0, 0); }
+        50%      { transform: scale(1.08) translate(-2%, 2%); }
+    }
+    .block-container {
+        padding-top: 0 !important; padding-bottom: 0 !important;
+        max-width: 100% !important;
+        display: flex !important; align-items: center !important;
+        justify-content: center !important; min-height: 100vh !important;
+    }
+    section[data-testid="stMain"] > div > div {
+        background: rgba(255,255,255,0.85) !important;
+        backdrop-filter: blur(24px) saturate(180%) !important;
+        -webkit-backdrop-filter: blur(24px) saturate(180%) !important;
+        border-radius: 24px !important;
+        padding: 28px 32px 18px !important;
+        max-width: 450px !important; width: 100% !important;
+        margin: 0 auto !important;
+        box-shadow: 0 24px 60px rgba(15,23,42,0.30),
+                    0 0 0 1px rgba(255,255,255,0.5) inset,
+                    0 0 40px rgba(102,126,234,0.15) !important;
+        border: 1px solid rgba(255,255,255,0.55) !important;
+        animation: cardIn 0.6s cubic-bezier(0.16, 1, 0.3, 1) both !important;
+        position: relative !important; z-index: 1 !important;
+    }
+    @keyframes cardIn {
+        from { opacity: 0; transform: translateY(18px) scale(0.97); }
+        to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .login-logo {
+        width: 52px; height: 52px; border-radius: 16px;
+        background: linear-gradient(135deg, #667eea, #764ba2);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 24px; margin: 0 auto 8px;
+        box-shadow: 0 8px 24px rgba(102,126,234,0.5);
+    }
+    .login-title {
+        text-align: center; font-size: 1.35rem; font-weight: 700;
+        color: #0f172a; margin: 0 0 3px; letter-spacing: -0.3px;
+    }
+    .login-subtitle {
+        text-align: center; font-size: 0.78rem; color: #64748b;
+        margin: 0 0 14px;
+    }
+    [data-testid="stHeader"], [data-testid="stSidebar"],
+    [data-testid="stToolbar"], #MainMenu, footer { display: none !important; }
+    [data-testid="stMain"] [data-testid="stTextInput"] { margin-bottom: 9px; }
+    [data-testid="stMain"] [data-testid="stTextInput"] label {
+        font-size: 0.78rem; font-weight: 600; color: #475569; margin-bottom: 4px;
+    }
+    [data-testid="stMain"] [data-testid="stTextInput"] input {
+        border-radius: 12px !important; border: 1.5px solid #e2e8f0 !important;
+        padding: 9px 14px !important; font-size: 0.9rem !important;
+        background: rgba(255,255,255,0.9) !important;
+        transition: all 0.2s ease !important;
+    }
+    [data-testid="stMain"] [data-testid="stTextInput"] input:focus {
+        border-color: #667eea !important;
+        box-shadow: 0 0 0 4px rgba(102,126,234,0.15) !important;
+        outline: none !important;
+    }
+    [data-testid="stMain"] [data-testid="stFormSubmitButton"] button {
+        background: linear-gradient(135deg, #667eea, #764ba2) !important;
+        border: none !important; border-radius: 12px !important;
+        font-weight: 600 !important; font-size: 0.92rem !important;
+        padding: 10px 0 !important; letter-spacing: 2px !important;
+        box-shadow: 0 6px 18px rgba(102,126,234,0.4) !important;
+        transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        margin-top: 4px !important;
+    }
+    [data-testid="stMain"] [data-testid="stFormSubmitButton"] button:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 10px 26px rgba(102,126,234,0.55) !important;
+    }
+    [data-testid="stMain"] [data-testid="stCaptionContainer"] {
+        margin-top: 10px !important; text-align: center !important;
+        padding-bottom: 0 !important;
+    }
+    [data-testid="stMain"] [data-testid="stAlert"] {
+        margin-bottom: 8px !important; border-radius: 10px !important;
+    }
+    </style>
+    <div class="login-logo">✨</div>
+    <h1 class="login-title">创建账号</h1>
+    <p class="login-subtitle">注册后即可使用 LifeOS 全部功能</p>
+    """, unsafe_allow_html=True)
+
+    with st.form("register_form", clear_on_submit=False):
+        username = st.text_input("用户名", key="reg_username",
+                                 placeholder="2-32 个字符")
+        password = st.text_input("密码", key="reg_password",
+                                 type="password", placeholder="至少 4 个字符")
+        confirm = st.text_input("确认密码", key="reg_confirm",
+                                type="password", placeholder="再次输入密码")
+        submitted = st.form_submit_button("注 册", use_container_width=True,
+                                          type="primary")
+
+    if submitted:
+        if password != confirm:
+            st.session_state["reg_error"] = "两次输入的密码不一致"
+        else:
+            ok, msg = _register_user(username, password)
+            if ok:
+                # 注册成功后自动登录
+                st.session_state["authenticated"] = True
+                st.session_state["username"] = username.strip()
+                st.session_state["reg_error"] = None
+                st.session_state["auth_view"] = "login"
+                st.rerun()
+            else:
+                st.session_state["reg_error"] = msg
+
+    if st.session_state.get("reg_error"):
+        st.error(st.session_state["reg_error"])
+
+    # 返回登录页（通栏按钮）
+    if st.button("已有账号？返回登录", key="back_to_login",
+                 use_container_width=True):
+        st.session_state["auth_view"] = "login"
+        st.session_state["reg_error"] = None
+        st.rerun()
+    st.stop()
+
+
+# ==========================================
 # 工具函数
 # ==========================================
 def progress_ring(percent: int, size: int = 36, color: str = "#6366f1", bg_color: str = "#e2e8f0") -> str:
@@ -2920,6 +3336,16 @@ def commitment_is_class(commitment) -> bool:
 
 
 # ==========================================
+# 登录门控：未认证则渲染登录或注册页，不初始化 agent
+# ==========================================
+if not _is_authenticated():
+    if st.session_state.get("auth_view") == "register":
+        _render_register_screen()
+    else:
+        _render_login_screen()
+
+
+# ==========================================
 # 初始化 Session State
 # ==========================================
 # 兼容热更新：Streamlit 只重跑 app.py、不重载已导入模块，若进程未重启且
@@ -3064,6 +3490,20 @@ with st.sidebar:
                     st.query_params["view"] = key
                     st.rerun()
 
+    # 用户信息 + 登出
+    st.markdown("---")
+    _user = st.session_state.get("username", "admin")
+    st.markdown(
+        f'<div style="font-size:0.78rem; color:#64748b; padding:0 4px 8px;">'
+        f'👤 {_user}</div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("🚪 退出登录", key="logout_btn", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.session_state["username"] = None
+        st.session_state["login_error"] = None
+        st.rerun()
+
 
     # 目标列表
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
@@ -3207,7 +3647,7 @@ st.markdown(f"""
 <div class="app-header">
     <div class="app-icon">✨</div>
     <div class="app-title">
-        <h1>{greeting}，{profile.name} 👋</h1>
+        <h1>{greeting}，{st.session_state.get("username", profile.name)} 👋</h1>
         <p>今天是 {today_str} · {weekday}，让我们一起高效学习</p>
     </div>
 </div>
