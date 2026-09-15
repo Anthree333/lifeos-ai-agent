@@ -1079,6 +1079,125 @@ def _is_authenticated() -> bool:
     return bool(st.session_state.get("authenticated", False))
 
 
+def _render_splash_screen() -> None:
+    """启动缓冲页：品牌动画播放后自动进入登录页。"""
+    st.markdown("""
+    <style>
+    html, body, [data-testid="stAppViewContainer"] {
+        overflow: hidden !important;
+        height: 100vh !important;
+    }
+    [data-testid="stAppViewContainer"] {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%) !important;
+        background-size: 200% 200% !important;
+        animation: spGradient 15s ease infinite !important;
+    }
+    @keyframes spGradient {
+        0%   { background-position: 0% 50%; }
+        50%  { background-position: 100% 50%; }
+        100% { background-position: 0% 50%; }
+    }
+    [data-testid="stAppViewContainer"]::before {
+        content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+        background:
+            radial-gradient(circle at 15% 25%, rgba(255,255,255,0.22) 0%, transparent 35%),
+            radial-gradient(circle at 85% 75%, rgba(255,255,255,0.16) 0%, transparent 35%);
+        animation: spOrb 12s ease-in-out infinite;
+    }
+    @keyframes spOrb {
+        0%, 100% { transform: scale(1); }
+        50%      { transform: scale(1.08); }
+    }
+    .block-container {
+        padding: 0 !important; max-width: 100% !important;
+        display: flex !important; align-items: center !important;
+        justify-content: center !important; min-height: 100vh !important;
+    }
+
+    /* Splash 内容容器：固定在视口中央 */
+    .splash-box {
+        position: relative; z-index: 2;
+        display: flex; flex-direction: column; align-items: center;
+        animation: spFade 0.5s ease both;
+    }
+    @keyframes spFade { from { opacity: 0; } to { opacity: 1; } }
+
+    .splash-logo {
+        width: 88px; height: 88px; border-radius: 26px;
+        background: linear-gradient(135deg, #667eea, #764ba2);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 44px; margin-bottom: 22px;
+        box-shadow: 0 14px 40px rgba(15,23,42,0.35);
+        animation: spPop 0.7s cubic-bezier(0.16, 1, 0.3, 1) both,
+                   spGlow 2.4s ease-in-out 0.7s infinite;
+    }
+    @keyframes spPop {
+        from { opacity: 0; transform: scale(0.4); }
+        to   { opacity: 1; transform: scale(1); }
+    }
+    @keyframes spGlow {
+        0%, 100% { box-shadow: 0 14px 40px rgba(15,23,42,0.35); }
+        50%      { box-shadow: 0 14px 52px rgba(240,147,251,0.55); }
+    }
+    .splash-title {
+        font-size: 2.4rem; font-weight: 800; color: #fff !important;
+        letter-spacing: 1px; margin: 0;
+        text-shadow: 0 4px 18px rgba(15,23,42,0.25);
+        animation: spUp 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.25s both;
+    }
+    .splash-slogan {
+        font-size: 0.95rem; color: rgba(255,255,255,0.88) !important;
+        margin: 10px 0 34px; letter-spacing: 3px;
+        animation: spUp 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.45s both;
+    }
+    @keyframes spUp {
+        from { opacity: 0; transform: translateY(14px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* 加载进度条 */
+    .splash-bar {
+        width: 160px; height: 4px; border-radius: 4px;
+        background: rgba(255,255,255,0.25); overflow: hidden;
+        animation: spUp 0.7s ease 0.6s both;
+    }
+    .splash-bar::after {
+        content: ""; display: block; height: 100%; width: 40%;
+        border-radius: 4px; background: #fff;
+        animation: spLoad 1.3s ease-in-out infinite;
+    }
+    @keyframes spLoad {
+        0%   { transform: translateX(-120%); }
+        100% { transform: translateX(380%); }
+    }
+
+    [data-testid="stHeader"], [data-testid="stSidebar"],
+    [data-testid="stToolbar"], #MainMenu, footer { display: none !important; }
+    </style>
+    <div class="splash-box">
+        <div class="splash-logo">✨</div>
+        <h1 class="splash-title">LifeOS</h1>
+        <p class="splash-slogan">让每一分钟都有方向</p>
+        <div class="splash-bar"></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 纯 Python 计时：首次渲染记录时间，等待动画时长后自动进入登录页
+    # （不依赖 JS/隐藏按钮，避免点击不触发导致一直停留在缓冲页）
+    import time as _time
+    SPLASH_SECONDS = 0.1
+    started = st.session_state.get("splash_started_at")
+    if started is None:
+        started = _time.monotonic()
+        st.session_state["splash_started_at"] = started
+    elapsed = _time.monotonic() - started
+    remaining = SPLASH_SECONDS - elapsed
+    if remaining > 0:
+        _time.sleep(remaining)
+    st.session_state["splash_done"] = True
+    st.rerun()
+
+
 def _render_login_screen() -> None:
     """渲染居中的登录卡片，未登录时调用并 st.stop()。"""
     st.markdown("""
@@ -2949,7 +3068,7 @@ def render_notes_view() -> None:
             st.text_input("笔记标题", placeholder="请输入标题",
                           key=f"nt_t_{nid}", on_change=_nt_sync_from_ui,
                           value=note.get("title", ""))
-            st.text_area("正文", placeholder="请输入正文，「Ctrl+/」快速呼出ima帮助写作",
+            st.text_area("正文", placeholder="请输入正文，记录学习思考，也可以写下日记与日常感悟",
                          key=f"nt_c_{nid}", on_change=_nt_sync_from_ui,
                          value=note.get("content", ""), height=560,
                          label_visibility="collapsed")
@@ -3339,7 +3458,9 @@ def commitment_is_class(commitment) -> bool:
 # 登录门控：未认证则渲染登录或注册页，不初始化 agent
 # ==========================================
 if not _is_authenticated():
-    if st.session_state.get("auth_view") == "register":
+    if not st.session_state.get("splash_done"):
+        _render_splash_screen()
+    elif st.session_state.get("auth_view") == "register":
         _render_register_screen()
     else:
         _render_login_screen()
